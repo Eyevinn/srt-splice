@@ -35,11 +35,23 @@ spec:
       containers:
         - name: srt-splice
           image: ghcr.io/eyevinn/srt-splice:latest  # pin a version tag in production
-          args: ["--listen", "0.0.0.0:9000"]
+          args: ["--listen", "0.0.0.0:9000", "--api", "0.0.0.0:9001"]
+          env:
+            # The address the outside world dials (your load balancer's DNS
+            # name or IP and port). Reported on GET /v1/info.
+            - name: SRT_SPLICE_PUBLIC
+              value: srt.example.com:9000
           ports:
             - name: srt
               containerPort: 9000
               protocol: UDP
+            - name: api
+              containerPort: 9001
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: api
           resources:
             requests:
               cpu: 100m
@@ -70,3 +82,27 @@ spec:
       port: 9000
       targetPort: srt
       protocol: UDP
+---
+# Internal access for services in the cluster (e.g. Strom): the SRT port and
+# the read-only HTTP API. Never expose the API port publicly.
+# Strom: STROM_SRT_RELAY=srt-splice-internal:9000 (the API defaults to port 9001
+# on the same host).
+apiVersion: v1
+kind: Service
+metadata:
+  name: srt-splice-internal
+  labels:
+    app.kubernetes.io/name: srt-splice
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: srt-splice
+  ports:
+    - name: srt
+      port: 9000
+      targetPort: srt
+      protocol: UDP
+    - name: api
+      port: 9001
+      targetPort: api
+      protocol: TCP

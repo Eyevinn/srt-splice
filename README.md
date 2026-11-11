@@ -47,9 +47,25 @@ docker run --rm -p 9000:9000/udp srt-splice
 docker compose -f examples/docker-compose.yml up --build
 ```
 
-Options: `--listen ADDR:PORT` (`-l`), `--no-fingerprint` (see
-[Direction](#direction-mpublish--mrequest)), `-v` (log per-session stats
-every 5 s).
+Options (environment variable in brackets):
+
+| Option | Default | |
+|---|---|---|
+| `--listen ADDR:PORT`, `-l` (`SRT_SPLICE_LISTEN`) | `0.0.0.0:9000` | The SRT UDP port, the one exposed publicly. |
+| `--api ADDR:PORT\|off` (`SRT_SPLICE_API`) | `0.0.0.0:9001` | Read-only HTTP API, **internal network only**. |
+| `--public HOST:PORT` (`SRT_SPLICE_PUBLIC`) | unset | The address the outside world dials, reported by the API. |
+| `--no-fingerprint` | off | See [Direction](#direction-mpublish--mrequest). |
+| `-v` | off | Log per-session stats every 5 s. |
+
+### HTTP API
+
+For services next to the relay, for example Strom asking which public
+address to show its users. Nothing in it is secret, but keep it off the
+public network.
+
+- `GET /v1/info` → `{"version":"0.0.1","public":"srt.example.com:9000","srt_port":9000}`
+  (`public` is `null` when `--public` is not set)
+- `GET /healthz` → `ok`
 
 Then start a receiver and a sender in either order, with the same streamid.
 Use a long random streamid and a passphrase (see [Security](#security)):

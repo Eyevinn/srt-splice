@@ -1,14 +1,20 @@
 # Run the relay locally: both SRT callers connect to udp://<host>:9000 with the
-# same streamid. The relay needs no configuration and no passphrase.
+# same streamid. The relay needs no passphrase. SRT_SPLICE_PUBLIC is the address
+# the outside world dials; the relay reports it on its internal HTTP API
+# (GET http://<host>:9001/v1/info), so a service such as Strom can show it.
 #
 #   docker compose -f examples/docker-compose.yml up --build
 services:
   srt-splice:
     build: ..
     image: srt-splice:local
-    command: ["--listen", "0.0.0.0:9000", "-v"]
+    command: ["--listen", "0.0.0.0:9000", "--api", "0.0.0.0:9001", "-v"]
+    environment:
+      SRT_SPLICE_PUBLIC: ${SRT_SPLICE_PUBLIC:-localhost:9000}
     ports:
       - "9000:9000/udp"
+      # The API is for local services only: bound to loopback.
+      - "127.0.0.1:9001:9001"
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]

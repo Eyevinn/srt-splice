@@ -11,9 +11,11 @@ RUN cargo build --release --locked \
 FROM scratch
 COPY --from=builder /src/target/release/srt-splice /srt-splice
 USER 65534:65534
-EXPOSE 9000/udp
+# 9000/udp: SRT, the public port. 9001/tcp: the read-only HTTP API (/v1/info),
+# for the internal network only.
+EXPOSE 9000/udp 9001/tcp
 # The relay keeps no state worth saving and has no signal handler. As PID 1 it
 # would ignore SIGTERM, so stop it with SIGKILL instead of waiting for a timeout.
 STOPSIGNAL SIGKILL
 ENTRYPOINT ["/srt-splice"]
-CMD ["--listen", "0.0.0.0:9000"]
+CMD ["--listen", "0.0.0.0:9000", "--api", "0.0.0.0:9001"]
