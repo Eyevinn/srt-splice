@@ -18,8 +18,14 @@ sees, the passphrase.
 It was built as a public front for [Strom](https://github.com/Eyevinn/strom)
 in Kubernetes: Strom and the outside world both connect *out* to one public
 UDP port, and Strom needs no listener port of its own. It does not depend
-on Strom and works with any SRT caller: OBS, vMix, ffmpeg, GStreamer, VLC,
-libsrt tools and others.
+on Strom.
+
+**Tested with:** libsrt 1.5 (`srt-live-transmit`, GStreamer `srtsrc`/`srtsink`
+in Strom, ffmpeg/ffplay, VLC 3.0.24) and the Rust `srt-protocol` crate.
+Other implementations (OBS, vMix, hardware encoders, gosrt, libsrt 1.4 and
+older) have not been tested yet. SRT implementations differ in how they read
+the handshake, so interop reports are welcome. See
+[docs/TESTING.md](docs/TESTING.md).
 
 ## Quick start
 
