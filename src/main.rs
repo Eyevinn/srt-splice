@@ -1,4 +1,4 @@
-//! srt-splice (spike): one UDP port, SRT callers pair up by streamid.
+//! srt-splice: one UDP port, SRT callers pair up by streamid.
 //!
 //! The relay answers the induction itself and holds each caller's
 //! conclusion until a second caller with the same streamid arrives. Then it

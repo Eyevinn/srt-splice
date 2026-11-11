@@ -1,0 +1,66 @@
+# Testing
+
+## Unit tests
+
+`cargo test` covers the wire format, the pairing rules (liveness, roles,
+encryption compatibility, reconnects), the streamid parsing and the HTTP
+API.
+
+## Interop and end-to-end results
+
+macOS, loopback, libsrt 1.5.6 `srt-live-transmit` and the Rust
+`srt-protocol` 0.4.4 crate, unless noted.
+
+| Case | Result |
+|---|---|
+| Unencrypted | ✅ 0 lost, p50 133.7 ms (133.4 ms direct, without the relay) |
+| AES-128 and AES-256 (CTR) | ✅ 0 lost, keys exchanged both ways, no clear packets |
+| Key refresh mid-stream (`kmrefreshrate=2000`) | ✅ in-band KMREQ/KMRSP forwarded, 0 lost |
+| Latency 500 ms (sender) vs 120 ms (receiver) | ✅ both get 500, measured p50 513 ms |
+| 5 % loss and 20 ms delay each way, latency 300 ms | ✅ 0 lost, 131 retransmits end to end; the same as direct through the same lossy proxy |
+| Sender connects first, receiver 1.5 s later | ✅ |
+| Receiver with `conntimeo=1500` and auto-reconnect, sender after 4 s | ✅ stale attempts are not paired, 0 lost |
+| Wrong passphrase on one side | ✅ no data reaches the receiver; the relay tears down after 3 s |
+| One side encrypted, the other not | ✅ never paired; the clear caller is refused with `SRT_REJ_UNSECURE` |
+| Stray clear caller on the id of an encrypted pair, before or between them | ✅ the pair meets with 0 lost; the stray neither pairs nor blocks |
+| Rust `srt-protocol` sender to a libsrt receiver, clear and AES | ✅ |
+| Direction with `m=request` / `m=publish`, libsrt and srt-protocol | ✅ |
+| No direction, `--no-fingerprint`, srt-protocol sender to libsrt | ❌ as expected, no data: the case the fingerprint fallback covers |
+| No direction, fingerprint on | ✅ |
+| Two callers with the same role from one host | ✅ never paired; the newer replaces the older |
+| **Strom**: ffmpeg → relay → Strom SRT input (`m=request`) → vision mixer → Strom SRT output (`m=publish`) → relay → receiver, AES-128, H.264 720p and AAC | ✅ video and sound end to end; Strom's 3 s reconnects replace their own earlier attempts |
+| **Open Live** on that Strom: relay source and output with a generated id; deactivate and reactivate | ✅ media end to end, the same ids after reactivation |
+| VLC 3.0.24 and ffplay (`ffmpeg-full`) pulling a relay output | ✅ |
+| AES-GCM | ⚠️ untested: Homebrew's libsrt is built without `ENABLE_AEAD_API_PREVIEW` and silently uses CTR |
+
+The `max=5000 ms` latency some measurements show is an artifact of the
+tools at shutdown. A direct connection without the relay shows the same.
+
+## How the cases are run
+
+[scripts/case.sh](../scripts/case.sh) runs one case against a running relay:
+1. A libsrt receiver (`srt-live-transmit`) connects first.
+2. A sender joins with the same streamid.
+3. A measuring tool reports loss, duplicates and latency at the receiver.
+
+The measuring tool is a separate program and not part of this repository: a
+test stream generator, a latency meter, a Rust `srt-protocol` sender, and a
+UDP proxy that drops and delays packets. Point `MEASURE_TOOL` at a
+compatible binary; the header of the script describes the interface it
+expects.
+
+```sh
+./target/release/srt-splice -l 127.0.0.1:9900 &
+RELAY=127.0.0.1:9900 MEASURE_TOOL=/path/to/tool \
+  ./scripts/case.sh aes128 "passphrase=$SRT_PASSPHRASE" "passphrase=$SRT_PASSPHRASE" 5
+```
+
+## Not tested yet
+
+- AES-GCM.
+- Bidirectional data (both sides sending).
+- IPv6.
+- A peer whose port changes mid-session (NAT rebinding).
+- libsrt 1.4 and older, hardware encoders, gosrt.
+- srt-protocol as the receiver.
+- Load: many sessions and high bitrates on one relay.

@@ -1,7 +1,7 @@
 # Security Policy
 
-This project is experimental and has no supported release yet. Fixes go to
-`main`.
+Fixes go to `main` and into the next release. Only the latest release is
+supported.
 
 ## Reporting a vulnerability
 

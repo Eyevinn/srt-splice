@@ -4,7 +4,7 @@ version = "0.1.1"
 edition = "2021"
 # 1.82: Option::is_none_or.
 rust-version = "1.82"
-description = "Experimental forwarding SRT relay on one UDP port: pairs two callers by streamid and splices their handshakes, so ARQ, latency and encryption stay end to end"
+description = "Forwarding SRT relay on one UDP port: pairs two callers by streamid and splices their handshakes, so ARQ, latency and encryption stay end to end"
 license = "MIT OR Apache-2.0"
 authors = ["Eyevinn Technology AB"]
 repository = "https://github.com/Eyevinn/srt-splice"
