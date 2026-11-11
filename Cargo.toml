@@ -1,0 +1,19 @@
+[package]
+name = "srt-splice"
+version = "0.0.1"
+edition = "2021"
+# 1.82: Option::is_none_or.
+rust-version = "1.82"
+description = "Experimental forwarding SRT relay on one UDP port: pairs two callers by streamid and splices their handshakes, so ARQ, latency and encryption stay end to end"
+license = "MIT OR Apache-2.0"
+authors = ["Eyevinn Technology AB"]
+repository = "https://github.com/Eyevinn/srt-splice"
+readme = "README.md"
+keywords = ["srt", "relay", "udp", "streaming", "video"]
+categories = ["network-programming", "multimedia::video", "command-line-utilities"]
+publish = false
+
+[dependencies]
+
+[profile.release]
+debug = 1

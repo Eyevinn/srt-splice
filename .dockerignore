@@ -1,0 +1,9 @@
+target/
+.git/
+.github/
+examples/
+scripts/
+.env
+.env.*
+*.md
+!README.md

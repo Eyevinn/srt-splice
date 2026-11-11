@@ -1,0 +1,15 @@
+# Run the relay locally: both SRT callers connect to udp://<host>:9000 with the
+# same streamid. The relay needs no configuration and no passphrase.
+#
+#   docker compose -f examples/docker-compose.yml up --build
+services:
+  srt-splice:
+    build: ..
+    image: srt-splice:local
+    command: ["--listen", "0.0.0.0:9000", "-v"]
+    ports:
+      - "9000:9000/udp"
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
