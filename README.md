@@ -219,7 +219,7 @@ macOS, loopback, libsrt 1.5.6 `srt-live-transmit` and the Rust
 | Receiver with `conntimeo=1500` and auto-reconnect, sender joins after 4 s (the receiver has reconnected from new ports twice) | ✅ stale attempts are not paired, 0 lost |
 | **Strom 0.7.2** (Docker) in a loop: `ffmpeg` → relay `cam1` → Strom MPEG-TS/SRT Input (caller, `m=request`, passthrough) → Strom MPEG-TS/SRT Output (caller, `m=publish`) → relay `pgm` → receiver; AES-128, H.264 720p 4 Mbit/s | ✅ decodable H.264 out, 348 frames of 375. Strom's 3 s reconnects replace their own earlier attempts |
 | Wrong passphrase on one side | ✅ no data reaches the receiver. The injected key gets no KMRSP and the relay tears down after 3 s (could be faster) |
-| One side encrypted, other not | ✅ both rejected with `SRT_REJ_UNSECURE` |
+| One side encrypted, other not | ✅ the newer caller is refused with `SRT_REJ_UNSECURE`; the one already waiting keeps its place, so a stray or hostile caller that knows the id cannot knock it out |
 | Rust `srt-protocol` 0.4.4 sender → libsrt receiver, plain + AES | ✅ after the ISN fix below |
 | Direction, `--no-fingerprint`: Rust sender → libsrt receiver `m=request` (Strom ingest) | ✅ |
 | Direction: libsrt ingest (`m=request`) / egress (`m=publish`), AES | ✅ / ✅ |

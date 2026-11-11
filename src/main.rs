@@ -500,35 +500,39 @@ impl Relay {
 
     fn pair(&mut self, a: Party, b: Party) {
         let sid = a.sid.clone();
-        let (a_km, b_km) = (a.hs.km(), b.hs.km());
-        match (a_km, b_km) {
-            (Some(_), None) | (None, Some(_)) => {
-                log!(
-                    self,
-                    "[{sid}] one side encrypted, the other not: rejecting both"
-                );
-                self.reject(a.addr, &a.hs, REJ_UNSECURE, "peer not encrypted");
-                self.reject(b.addr, &b.hs, REJ_UNSECURE, "peer not encrypted");
-                return;
-            }
-            (Some(ka), Some(kb)) if km_params(ka) != km_params(kb) => {
-                log!(
-                    self,
-                    "[{sid}] key params differ {:?} vs {:?}: rejecting both",
-                    km_params(ka),
-                    km_params(kb)
-                );
-                let code = if km_params(ka).map(|k| k.0) != km_params(kb).map(|k| k.0) {
-                    REJ_CRYPTO
+        // On an encryption mismatch only the newer caller is refused: the one
+        // that waited keeps its place, so a stray or hostile caller that knows
+        // the id cannot knock the legitimate one out.
+        let (old, new) = if a.arrived <= b.arrived {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let (old_km, new_km) = (old.hs.km(), new.hs.km());
+        let mismatch = match (old_km, new_km) {
+            (Some(_), None) | (None, Some(_)) => Some((REJ_UNSECURE, "encrypted on one side only")),
+            (Some(ko), Some(kn)) if km_params(ko) != km_params(kn) => {
+                if km_params(ko).map(|k| k.0) != km_params(kn).map(|k| k.0) {
+                    Some((REJ_CRYPTO, "different cipher than the waiting peer"))
                 } else {
-                    REJ_BADSECRET
-                };
-                self.reject(a.addr, &a.hs, code, "key params differ");
-                self.reject(b.addr, &b.hs, code, "key params differ");
-                return;
+                    Some((REJ_BADSECRET, "different key length than the waiting peer"))
+                }
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some((code, why)) = mismatch {
+            log!(
+                self,
+                "[{sid}] {} refused ({why}); {} keeps waiting",
+                new.addr,
+                old.addr
+            );
+            self.reject(new.addr, &new.hs, code, why);
+            self.pending.entry(sid).or_default().push(old);
+            return;
         }
+        let (a, b) = (old, new);
+        let a_km = a.hs.km();
         let Ok((isn_a, isn_b, how)) = response_isns(&a, &b, self.fingerprint) else {
             log!(self, "[{sid}] both sides m={:?}: rejecting both", a.mode);
             self.reject(a.addr, &a.hs, REJX_BAD_MODE, "same m as peer");
