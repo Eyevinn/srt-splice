@@ -64,7 +64,7 @@ For services next to the relay, for example Strom asking which public
 address to show its users. Nothing in it is secret, but keep it off the
 public network.
 
-- `GET /v1/info` → `{"version":"0.0.1","public":"srt.example.com:9000","srt_port":9000}`
+- `GET /v1/info` → `{"version":"0.1.0","public":"srt.example.com:9000","srt_port":9000}`
   (`public` is `null` when `--public` is not set)
 - `GET /healthz` → `ok`
 
