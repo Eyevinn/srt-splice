@@ -75,6 +75,8 @@ struct Party {
     mode: Mode,
     /// The caller's time zero on our clock (its packet timestamps are µs since).
     start: Instant,
+    /// When this caller's first conclusion arrived.
+    arrived: Instant,
     last_seen: Instant,
 }
 
@@ -154,13 +156,29 @@ fn response_isns(a: &Party, b: &Party, fingerprint: bool) -> Result<(u32, u32, S
     Ok((ia, ib, how))
 }
 
-/// Callers waiting on one streamid. `second` is paired with `first` only
-/// when `first` proves it is still there by repeating its conclusion, so a
-/// caller that gave up (or a caller's own earlier attempt, before it
-/// reconnected from a new port) is never paired.
-struct Waiting {
-    first: Party,
-    second: Option<Party>,
+/// At most this many callers wait on one streamid at a time.
+const MAX_WAITING: usize = 4;
+
+/// How long a replaced attempt is ignored, so it cannot take the place back.
+const REPLACED_TTL: Duration = Duration::from_secs(5);
+
+/// Whether two waiting callers may be paired: never two that state the
+/// same role (two `m=request` are one receiver reconnecting, or a mistake).
+fn compatible(a: &Party, b: &Party) -> bool {
+    sender(a.mode, b.mode).is_ok()
+}
+
+/// Whether `a` and `b` are both known to be there: the older of the two
+/// has repeated its conclusion since the newer one arrived. A caller that
+/// gave up, or a caller's own earlier attempt before it reconnected from a
+/// new port, never repeats, so it is never paired.
+fn both_alive(a: &Party, b: &Party, now: Instant) -> bool {
+    let (old, new) = if a.arrived <= b.arrived {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    old.last_seen > new.arrived && new.alive(now) && old.alive(now)
 }
 
 struct Inject {
@@ -205,7 +223,10 @@ struct Relay {
     t0: Instant,
     /// Per-process random key for handshake cookies.
     secret: RandomState,
-    pending: HashMap<String, Waiting>,
+    /// Callers waiting for a peer, per pairing key.
+    pending: HashMap<String, Vec<Party>>,
+    /// Attempts replaced by a reconnect of the same caller; ignored a while.
+    replaced: HashMap<SocketAddr, Instant>,
     legs: HashMap<SocketAddr, Leg>,
 }
 
@@ -372,46 +393,88 @@ impl Relay {
         // The caller's clock: its timestamp is µs since its start. Remote
         // input, so never let it underflow our clock.
         let ts = Duration::from_micros(timestamp(p) as u64);
-        let party = Party {
+        let mut party = Party {
             addr: from,
             sid: sid.clone(),
             mode,
             start: now.checked_sub(ts).unwrap_or(now),
+            arrived: now,
             last_seen: now,
             hs,
         };
-        // No answer to a waiting caller: it keeps repeating its conclusion.
-        let Some(w) = self.pending.get_mut(&sid) else {
-            self.log_waiting(&party, "waiting for a peer");
-            self.pending.insert(
-                sid,
-                Waiting {
-                    first: party,
-                    second: None,
-                },
-            );
-            return;
-        };
-        if w.first.addr == from {
-            // The first caller is still there: pair if a second one is.
-            w.first = party;
-            if w.second.as_ref().is_some_and(|s| s.alive(now)) {
-                let w = self.pending.remove(&sid).unwrap();
-                self.pair(w.first, w.second.unwrap());
+        if let Some(t) = self.replaced.get_mut(&from) {
+            // Stays ignored for as long as it keeps repeating.
+            *t = now;
+            if self.verbose {
+                log!(self, "[{sid}] {from}: replaced attempt, ignored");
             }
-        } else if w.second.as_ref().is_some_and(|s| s.addr == from) {
-            w.second = Some(party);
-        } else if w.second.as_ref().is_none_or(|s| !s.alive(now)) {
-            self.log_waiting(&party, "peer found, pairing on its next repeat");
-            self.pending.get_mut(&sid).unwrap().second = Some(party);
-        } else {
-            self.reject(
+            return;
+        }
+        // No answer to a waiting caller: it keeps repeating its conclusion.
+        let waiting = self.pending.entry(sid.clone()).or_default();
+        if let Some(i) = waiting.iter().position(|c| c.addr == from) {
+            // A repeat: refresh it, then pair with the best live peer.
+            party.arrived = waiting[i].arrived;
+            waiting[i] = party;
+            let x = &waiting[i];
+            let peer = waiting
+                .iter()
+                .enumerate()
+                .filter(|(j, y)| *j != i && compatible(x, y) && both_alive(x, y, now))
+                .max_by_key(|(_, y)| y.last_seen)
+                .map(|(j, _)| j);
+            if let Some(j) = peer {
+                let (hi, lo) = (i.max(j), i.min(j));
+                let a = waiting.remove(hi);
+                let b = waiting.remove(lo);
+                if waiting.is_empty() {
+                    self.pending.remove(&sid);
+                }
+                self.pair(b, a);
+            }
+            return;
+        }
+        // A new caller stating the same role as a waiting one. From the
+        // same host it is that caller reconnecting (a new port after its
+        // connect timeout): it replaces the old attempt, which is then
+        // ignored for a while so it cannot take the place back. From
+        // another host while the first is alive, it is a second sender or
+        // receiver: rejected.
+        if mode != Mode::Unknown {
+            if let Some(i) = waiting.iter().position(|c| c.mode == mode) {
+                let (old_addr, old_alive) = (waiting[i].addr, waiting[i].alive(now));
+                if old_addr.ip() != from.ip() && old_alive {
+                    return self.reject(
+                        from,
+                        &party.hs,
+                        REJX_CONFLICT,
+                        &format!("streamid {sid:?}: another m={mode:?} is waiting"),
+                    );
+                }
+                waiting.remove(i);
+                self.replaced.insert(old_addr, now);
+                log!(
+                    self,
+                    "[{sid}] {from} replaces {old_addr} (same role {mode:?})"
+                );
+            }
+        }
+        let waiting = self.pending.get_mut(&sid).unwrap();
+        if waiting.len() >= MAX_WAITING {
+            return self.reject(
                 from,
                 &party.hs,
                 REJX_CONFLICT,
-                &format!("streamid {sid:?}: two callers already waiting"),
+                &format!("streamid {sid:?}: too many callers waiting"),
             );
         }
+        let what = if waiting.is_empty() {
+            "waiting for a peer"
+        } else {
+            "waiting; pairs once both have repeated"
+        };
+        self.log_waiting(&party, what);
+        self.pending.get_mut(&sid).unwrap().push(party);
     }
 
     fn log_waiting(&self, p: &Party, what: &str) {
@@ -581,29 +644,12 @@ impl Relay {
             log!(self, "{a}: no answer to the injected key");
             self.teardown(a, "key injection unanswered");
         }
-        // Waiting callers that gave up: drop them, promote a live second.
-        let mut promoted = Vec::new();
+        self.replaced.retain(|_, t| now - *t < REPLACED_TTL);
+        // Waiting callers that gave up.
         self.pending.retain(|_, w| {
-            if w.second.as_ref().is_some_and(|s| !s.alive(now)) {
-                w.second = None;
-            }
-            if !w.first.alive(now) {
-                match w.second.take() {
-                    Some(s) => {
-                        w.first = s;
-                        promoted.push(w.first.addr);
-                    }
-                    None => return false,
-                }
-            }
-            true
+            w.retain(|c| c.alive(now));
+            !w.is_empty()
         });
-        for a in promoted {
-            log!(
-                self,
-                "{a}: the caller it waited on gave up; now waiting itself"
-            );
-        }
         // Idle sessions.
         let idle: Vec<_> = self
             .legs
@@ -692,6 +738,7 @@ fn main() {
         t0: Instant::now(),
         secret: RandomState::new(),
         pending: HashMap::new(),
+        replaced: HashMap::new(),
         legs: HashMap::new(),
     };
     log!(r, "srt-splice listening on udp {listen}");
@@ -755,6 +802,58 @@ mod tests {
         assert_eq!(sender(Unknown, Unknown), Ok(None));
         assert_eq!(sender(Publish, Publish), Err(()));
         assert_eq!(sender(Request, Request), Err(()));
+    }
+
+    fn party(port: u16, mode: Mode, arrived: Instant, last_seen: Instant) -> Party {
+        Party {
+            addr: SocketAddr::from(([127, 0, 0, 1], port)),
+            hs: Handshake {
+                version: 5,
+                enc_field: 0,
+                ext_field: 0,
+                isn: 0,
+                mss: 1500,
+                flow: 8192,
+                hs_type: HS_CONCLUSION,
+                socket_id: port as u32,
+                cookie: 0,
+                peer_ip: [0; 16],
+                exts: vec![],
+            },
+            sid: "s".into(),
+            mode,
+            start: arrived,
+            arrived,
+            last_seen,
+        }
+    }
+
+    #[test]
+    fn pairing_needs_a_repeat_from_the_older_caller() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let new = party(2, Mode::Unknown, ms(1000), ms(1000));
+        // The older caller last repeated before the new one arrived: it may
+        // have given up (or be the new caller's own earlier attempt).
+        let stale = party(1, Mode::Unknown, ms(0), ms(900));
+        assert!(!both_alive(&stale, &new, ms(1010)));
+        // It repeated after the new one arrived: pair.
+        let live = party(1, Mode::Unknown, ms(0), ms(1100));
+        assert!(both_alive(&live, &new, ms(1110)));
+        assert!(both_alive(&new, &live, ms(1110)));
+    }
+
+    #[test]
+    fn same_role_never_pairs() {
+        let t = Instant::now();
+        let req = party(1, Mode::Request, t, t);
+        let req2 = party(2, Mode::Request, t, t);
+        let publ = party(3, Mode::Publish, t, t);
+        let any = party(4, Mode::Unknown, t, t);
+        assert!(!compatible(&req, &req2));
+        assert!(compatible(&req, &publ));
+        assert!(compatible(&req, &any));
+        assert!(compatible(&any, &party(5, Mode::Unknown, t, t)));
     }
 
     #[test]

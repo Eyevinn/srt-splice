@@ -104,8 +104,12 @@ fingerprinting is needed.
   outside sends to plain `<id>`.
 - Output from Strom: Strom connects with `#!::r=<id>,m=publish`, and the
   outside pulls from plain `<id>`.
-- Either side may state it. Both stating the same role: both are rejected
-  with `SRT_REJX_BAD_MODE` (1405).
+- Either side may state it. Two callers that state the same role are never
+  paired. From the same host, the newer one is that caller reconnecting
+  (callers retry from a new port after their connect timeout, as Strom's
+  SRT blocks do every 3 s) and replaces the older attempt. From another
+  host while the first is still waiting, it is rejected with
+  `SRT_REJX_CONFLICT` (1409).
 - No direction (plain streamids on both sides, or `m=bidirectional`):
   **fallback:** recognize srt-protocol by its HSREQ (see
   [Findings](#findings)), otherwise assume libsrt on both sides.
@@ -124,11 +128,12 @@ In a URI the streamid must be URL-encoded:
    the conclusion without answering. The caller resends it every 250 ms
    until its connect timeout. A waiting caller not heard from for 400 ms is
    treated as gone.
-3. When a second caller with the same streamid arrives, the relay waits
-   for the first caller's next repeat (at most about 250 ms) as proof that
-   it is still there, and then answers both. This way a caller that gave up,
-   or the caller's own earlier attempt before it reconnected from a new
-   port, is never paired. Each side gets the **other side's** values:
+3. Up to four callers can wait on one streamid. Two of them are paired
+   once the older one has repeated its conclusion after the newer one
+   arrived (at most about 250 ms), as proof that both are still there. So a
+   caller that gave up, or a caller's own earlier attempt before it
+   reconnected from a new port, is never paired. Each side gets the
+   **other side's** values:
    - socket id, so `dest socket id` in every later packet is already right
      and nothing in the header is rewritten. That matters for AES-GCM,
      which authenticates the whole 16-byte header.
@@ -196,6 +201,7 @@ macOS, loopback, libsrt 1.5.6 `srt-live-transmit` and the Rust
 | 5 % loss + 20 ms each way (lossy proxy), latency 300 | ✅ 0 lost, 131 retransmits end to end. Same as direct through the same proxy (0 lost, p50 337 ms) |
 | Sender connects first, receiver 1.5 s later | ✅ |
 | Receiver with `conntimeo=1500` and auto-reconnect, sender joins after 4 s (the receiver has reconnected from new ports twice) | ✅ stale attempts are not paired, 0 lost |
+| **Strom 0.7.2** (Docker) in a loop: `ffmpeg` → relay `cam1` → Strom MPEG-TS/SRT Input (caller, `m=request`, passthrough) → Strom MPEG-TS/SRT Output (caller, `m=publish`) → relay `pgm` → receiver; AES-128, H.264 720p 4 Mbit/s | ✅ decodable H.264 out, 348 frames of 375. Strom's 3 s reconnects replace their own earlier attempts |
 | Wrong passphrase on one side | ✅ no data reaches the receiver. The injected key gets no KMRSP and the relay tears down after 3 s (could be faster) |
 | One side encrypted, other not | ✅ both rejected with `SRT_REJ_UNSECURE` |
 | Rust `srt-protocol` 0.4.4 sender → libsrt receiver, plain + AES | ✅ after the ISN fix below |
@@ -204,7 +210,7 @@ macOS, loopback, libsrt 1.5.6 `srt-live-transmit` and the Rust
 | Direction: Rust sender declares `m=publish` itself | ✅ |
 | No direction, `--no-fingerprint`: Rust sender → libsrt | ❌ as expected: 0 packets. This is the case the fallback covers |
 | No direction, fingerprint on: Rust sender → libsrt | ✅ |
-| Both `m=publish` | ✅ both rejected with 1405 |
+| Both `m=publish` (same host) | ✅ never paired; the newer replaces the older |
 | AES-GCM | ⚠️ **untested**, see [Limits](#limits) |
 
 The `max=5000 ms` in the measurements is an artifact of the tools at
