@@ -119,6 +119,25 @@ flags exactly `0x27`), and otherwise assumes libsrt. That fingerprint is
 fragile, so give the direction where you can. `--no-fingerprint` turns the
 fallback off.
 
+### libsrt 1.5.0 to 1.5.2 as receiver
+
+libsrt 1.5.0, 1.5.1 and 1.5.2 create the receive buffer from the caller's
+*own* ISN (`CRcvBuffer(m_iISN, ...)` in core.cpp), not from the peer's ISN
+in the conclusion response. 1.5.3 fixed this (`m_iPeerISN`); 1.4.x uses the
+old buffer and is not affected. Against a listener the two ISNs are equal.
+Through the relay they differ, so such a caller breaks the connection as
+soon as it receives data ("SEQUENCE DISCREPANCY ... past max"). As a sender
+it works. The relay cannot rewrite sequence numbers instead: they are part
+of the AES-CTR/GCM IV.
+
+The relay reads the version from the HSREQ:
+- **Direction known, affected receiver:** if the sender adopts the response
+  ISN (srt-protocol), both responses carry the *receiver's* ISN, and it
+  works. Otherwise the receiver is refused with `SRT_REJX_UNACCEPTABLE`
+  (1406) and a log line naming its version. The sender keeps waiting.
+- **No direction:** never refused, since an affected caller that only sends
+  works. The relay logs a warning at pairing.
+
 ## What the relay sees
 
 What SRT carries in clear text: sequence numbers, retransmit flags, the key

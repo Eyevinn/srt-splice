@@ -38,6 +38,7 @@ pub const REJ_CRYPTO: u32 = 17;
 // SRT_REJX_* (access control, 1000 + HTTP-like code)
 pub const REJX_BAD_REQUEST: u32 = 1400;
 pub const REJX_BAD_MODE: u32 = 1405;
+pub const REJX_UNACCEPTABLE: u32 = 1406;
 pub const REJX_CONFLICT: u32 = 1409;
 
 // KM message (haicrypt/hcrypt_msg.h): byte offsets.

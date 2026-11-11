@@ -3,8 +3,8 @@
 ## Unit tests
 
 `cargo test` covers the wire format, the pairing rules (liveness, roles,
-encryption compatibility, reconnects), the streamid parsing and the HTTP
-API.
+encryption compatibility, reconnects, the libsrt 1.5.0–1.5.2 receiver
+guard), the streamid parsing and the HTTP API.
 
 ## Interop and end-to-end results
 
@@ -31,7 +31,16 @@ macOS, loopback, libsrt 1.5.6 `srt-live-transmit` and the Rust
 | **Strom**: ffmpeg → relay → Strom SRT input (`m=request`) → vision mixer → Strom SRT output (`m=publish`) → relay → receiver, AES-128, H.264 720p and AAC | ✅ video and sound end to end; Strom's 3 s reconnects replace their own earlier attempts |
 | **Open Live** on that Strom: relay source and output with a generated id; deactivate and reactivate | ✅ media end to end, the same ids after reactivation |
 | VLC 3.0.24 and ffplay (`ffmpeg-full`) pulling a relay output | ✅ |
+| libsrt 1.4.0 (Ubuntu focal) and 1.4.2 (Debian bullseye), as sender and as receiver, AES and clear, with and without `m=` on the other side | ✅ 0 lost |
+| libsrt 1.5.1 (Debian bookworm) as sender, AES and clear, with and without `m=` | ✅ 0 lost |
+| libsrt 1.5.1 as receiver | ❌ "SEQUENCE DISCREPANCY" before the guard: 1.5.0–1.5.2 expect data from their own ISN (see [DESIGN.md](DESIGN.md#libsrt-150-to-152-as-receiver)). Now, with a direction, refused with 1406 right at pairing (about 150 ms); without one, paired with a warning |
 | AES-GCM | ⚠️ untested: Homebrew's libsrt is built without `ENABLE_AEAD_API_PREVIEW` and silently uses CTR |
+
+The libsrt 1.4 and 1.5.1 cases ran in Docker (colima) on macOS against the
+relay on the host, with the distro packages (GnuTLS flavour on Debian) and
+libsrt 1.5.7 on the other side. Their `srt-live-transmit` does not
+URL-decode the streamid: pass `#!::r=…,m=…` unencoded there. libsrt 1.3.x is
+not tested (no distro package).
 
 The `max=5000 ms` latency some measurements show is an artifact of the
 tools at shutdown. A direct connection without the relay shows the same.
@@ -61,6 +70,6 @@ RELAY=127.0.0.1:9900 MEASURE_TOOL=/path/to/tool \
 - Bidirectional data (both sides sending).
 - IPv6.
 - A peer whose port changes mid-session (NAT rebinding).
-- libsrt 1.4 and older, hardware encoders, gosrt.
+- libsrt 1.3 and older, hardware encoders, gosrt.
 - srt-protocol as the receiver.
 - Load: many sessions and high bitrates on one relay.

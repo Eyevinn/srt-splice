@@ -101,6 +101,28 @@ impl Party {
     fn adopts_response_isn(&self) -> bool {
         matches!(self.hs.hsreq(), Some((0x0001_0301, 0x27, _)))
     }
+
+    /// The SRT version this caller announces in its HSREQ (`0x00MMmmpp`).
+    fn srt_version(&self) -> u32 {
+        self.hs.hsreq().map_or(0, |(v, _, _)| v)
+    }
+}
+
+/// `0x00010501` as `1.5.1`.
+fn version_str(v: u32) -> String {
+    format!("{}.{}.{}", (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF)
+}
+
+/// Whether this caller's receive buffer starts at its *own* ISN rather than
+/// the peer's ISN from the conclusion response. libsrt 1.5.0 to 1.5.2 do
+/// that (`CRcvBuffer(m_iISN, ...)` in core.cpp; fixed in 1.5.3 with
+/// `m_iPeerISN`). Against a listener the two are equal; through the relay
+/// they differ unless the peer sends from it, so such a caller breaks the
+/// connection as soon as it receives data ("SEQUENCE DISCREPANCY"). As a
+/// sender it works. The relay cannot rewrite sequence numbers instead: they
+/// are part of the AES-CTR/GCM IV.
+fn rcv_buffer_uses_own_isn(p: &Party) -> bool {
+    (0x0001_0500..=0x0001_0502).contains(&p.srt_version())
 }
 
 /// Which side sends media, from the `m` keys: Some(true) = a, Some(false)
@@ -115,20 +137,54 @@ fn sender(a: Mode, b: Mode) -> Result<Option<bool>, ()> {
     }
 }
 
+/// Why two callers that met cannot be paired as they are.
+#[derive(Debug, PartialEq, Eq)]
+enum NoPair {
+    /// Both state the same role.
+    SameRole,
+    /// The receiver (`a` if `a_receives`) cannot receive through the relay
+    /// (see `rcv_buffer_uses_own_isn`); the sender may keep waiting.
+    Receiver { a_receives: bool, why: String },
+}
+
 /// The ISNs to put in the responses to (a, b), so that the data sender
-/// sends from what the receiver expects. Err if the modes conflict.
+/// sends from what the receiver expects.
 ///
 /// With a known direction, both responses carry the sender's own ISN: the
 /// sender gets its ISN echoed, as from any listener, so it sends from it
 /// whether it is libsrt (own ISN) or srt-protocol (response ISN); every
 /// receiver expects the peer's data from the response ISN. No fingerprint.
+/// Except for a receiver that expects data from its own ISN (libsrt
+/// 1.5.0-1.5.2): it works only with a sender that sends from the response
+/// ISN, and then both get the receiver's ISN; otherwise it is refused.
 ///
 /// Without one, fall back to recognising srt-protocol (`fingerprint`), or
 /// assume libsrt on both sides.
-fn response_isns(a: &Party, b: &Party, fingerprint: bool) -> Result<(u32, u32, String), ()> {
-    if let Some(a_sends) = sender(a.mode, b.mode)? {
-        let s = if a_sends { a } else { b };
-        let who = if a_sends { "a" } else { "b" };
+fn response_isns(a: &Party, b: &Party, fingerprint: bool) -> Result<(u32, u32, String), NoPair> {
+    if let Some(a_sends) = sender(a.mode, b.mode).map_err(|()| NoPair::SameRole)? {
+        let (s, r) = if a_sends { (a, b) } else { (b, a) };
+        let (who, rwho) = if a_sends { ("a", "b") } else { ("b", "a") };
+        if rcv_buffer_uses_own_isn(r) {
+            if !s.adopts_response_isn() {
+                return Err(NoPair::Receiver {
+                    a_receives: !a_sends,
+                    why: format!(
+                        "libsrt {} cannot receive through the relay (it expects data from its \
+                         own ISN); the receiver needs libsrt 1.5.3+ or 1.4.x",
+                        version_str(r.srt_version())
+                    ),
+                });
+            }
+            return Ok((
+                r.hs.isn,
+                r.hs.isn,
+                format!(
+                    "direction: {who} sends from the response ISN, {rwho} (libsrt {}) \
+                     expects its own: both get {rwho}'s ISN",
+                    version_str(r.srt_version())
+                ),
+            ));
+        }
         return Ok((
             s.hs.isn,
             s.hs.isn,
@@ -579,12 +635,36 @@ impl Relay {
         let sid = a.sid.clone();
         let (a, b) = oldest_first(a, b);
         let a_km = a.hs.km();
-        let Ok((isn_a, isn_b, how)) = response_isns(&a, &b, self.fingerprint) else {
-            log!(self, "[{sid}] both sides m={:?}: rejecting both", a.mode);
-            self.reject(a.addr, &a.hs, REJX_BAD_MODE, "same m as peer");
-            self.reject(b.addr, &b.hs, REJX_BAD_MODE, "same m as peer");
-            return;
+        let (isn_a, isn_b, how) = match response_isns(&a, &b, self.fingerprint) {
+            Ok(r) => r,
+            Err(NoPair::SameRole) => {
+                log!(self, "[{sid}] both sides m={:?}: rejecting both", a.mode);
+                self.reject(a.addr, &a.hs, REJX_BAD_MODE, "same m as peer");
+                self.reject(b.addr, &b.hs, REJX_BAD_MODE, "same m as peer");
+                return;
+            }
+            Err(NoPair::Receiver { a_receives, why }) => {
+                let (r, s) = if a_receives { (a, b) } else { (b, a) };
+                self.reject(r.addr, &r.hs, REJX_UNACCEPTABLE, &format!("[{sid}] {why}"));
+                // The sender was fine: it keeps waiting for another receiver.
+                self.log_waiting(&s, "waiting for a peer");
+                self.pending.entry(sid).or_default().push(s);
+                return;
+            }
         };
+        if sender(a.mode, b.mode) == Ok(None) {
+            for p in [&a, &b] {
+                if rcv_buffer_uses_own_isn(p) {
+                    log!(
+                        self,
+                        "[{sid}] WARNING: {} is libsrt {}, which can only send through the \
+                         relay; if it receives, it breaks the connection (needs 1.5.3+ or 1.4.x)",
+                        p.addr,
+                        version_str(p.srt_version())
+                    );
+                }
+            }
+        }
         let lat = |p: &Party| {
             let (_, _, w) = p.hs.hsreq().unwrap();
             (w >> 16).max(w & 0xFFFF)
@@ -891,7 +971,8 @@ mod tests {
                 version: 5,
                 enc_field: 0,
                 ext_field: 0,
-                isn: 0,
+                // A distinct ISN per caller.
+                isn: 1000 * port as u32,
                 mss: 1500,
                 flow: 8192,
                 hs_type: HS_CONCLUSION,
@@ -934,6 +1015,116 @@ mod tests {
         assert!(compatible(&req, &publ));
         assert!(compatible(&req, &any));
         assert!(compatible(&any, &party(5, Mode::Unknown, t, t)));
+    }
+
+    /// `p` with an HSREQ announcing this SRT version and these flags.
+    fn srt(mut p: Party, version: u32, flags: u32) -> Party {
+        p.hs.exts.retain(|e| e.cmd != CMD_HSREQ);
+        let mut data = Vec::new();
+        for w in [version, flags, (120 << 16) | 120] {
+            data.extend(w.to_be_bytes());
+        }
+        p.hs.exts.push(Ext {
+            cmd: CMD_HSREQ,
+            data,
+        });
+        p
+    }
+
+    /// `p` as libsrt of this version (its usual flags).
+    fn libsrt(p: Party, version: u32) -> Party {
+        srt(p, version, 0xBF)
+    }
+
+    /// `p` as srt-protocol 0.4 (adopts the response ISN).
+    fn srt_protocol(p: Party) -> Party {
+        srt(p, 0x0001_0301, 0x27)
+    }
+
+    #[test]
+    fn affected_libsrt_versions() {
+        let t = Instant::now();
+        let v = |v| rcv_buffer_uses_own_isn(&libsrt(party(1, Mode::Unknown, t, t), v));
+        assert!(v(0x0001_0500) && v(0x0001_0501) && v(0x0001_0502));
+        assert!(!v(0x0001_0402) && !v(0x0001_0400) && !v(0x0001_0503) && !v(0x0001_0506));
+        assert_eq!(version_str(0x0001_0501), "1.5.1");
+    }
+
+    #[test]
+    fn affected_receiver_refused_when_sender_is_libsrt() {
+        let t = Instant::now();
+        let rcv = libsrt(party(1, Mode::Unknown, t, t), 0x0001_0501);
+        let snd = libsrt(party(2, Mode::Publish, t, t), 0x0001_0506);
+        // Refused with 1406 in pair(); only the receiver.
+        assert!(matches!(
+            response_isns(&rcv, &snd, true),
+            Err(NoPair::Receiver {
+                a_receives: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            response_isns(&snd, &rcv, true),
+            Err(NoPair::Receiver {
+                a_receives: false,
+                ..
+            })
+        ));
+        // The same with the direction stated by the receiver.
+        let rcv = libsrt(party(1, Mode::Request, t, t), 0x0001_0502);
+        let snd = libsrt(party(2, Mode::Unknown, t, t), 0x0001_0501);
+        assert!(matches!(
+            response_isns(&snd, &rcv, false),
+            Err(NoPair::Receiver {
+                a_receives: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn affected_receiver_with_adopting_sender_gets_its_own_isn() {
+        let t = Instant::now();
+        let rcv = libsrt(party(1, Mode::Request, t, t), 0x0001_0500);
+        let snd = srt_protocol(party(2, Mode::Unknown, t, t));
+        let (ia, ib, _) = response_isns(&rcv, &snd, true).unwrap();
+        assert_eq!((ia, ib), (rcv.hs.isn, rcv.hs.isn));
+        let (ia, ib, _) = response_isns(&snd, &rcv, false).unwrap();
+        assert_eq!((ia, ib), (rcv.hs.isn, rcv.hs.isn));
+    }
+
+    #[test]
+    fn affected_sender_works() {
+        let t = Instant::now();
+        let snd = libsrt(party(1, Mode::Publish, t, t), 0x0001_0501);
+        let rcv = libsrt(party(2, Mode::Unknown, t, t), 0x0001_0506);
+        let (ia, ib, _) = response_isns(&snd, &rcv, true).unwrap();
+        assert_eq!((ia, ib), (snd.hs.isn, snd.hs.isn));
+    }
+
+    #[test]
+    fn unknown_direction_is_never_refused() {
+        let t = Instant::now();
+        let a = libsrt(party(1, Mode::Unknown, t, t), 0x0001_0501);
+        let b = libsrt(party(2, Mode::Unknown, t, t), 0x0001_0506);
+        // Not refused: libsrt both, each gets the other's ISN (warned in pair()).
+        let (ia, ib, _) = response_isns(&a, &b, true).unwrap();
+        assert_eq!((ia, ib), (b.hs.isn, a.hs.isn));
+        // Both affected: still paired (one of them may only send).
+        let b = libsrt(party(2, Mode::Unknown, t, t), 0x0001_0502);
+        assert!(response_isns(&a, &b, true).is_ok());
+        assert!(response_isns(&a, &b, false).is_ok());
+    }
+
+    #[test]
+    fn unaffected_versions_pair_as_before() {
+        let t = Instant::now();
+        for v in [0x0001_0400, 0x0001_0402, 0x0001_0503, 0x0001_0506] {
+            let rcv = libsrt(party(1, Mode::Request, t, t), v);
+            let snd = libsrt(party(2, Mode::Unknown, t, t), 0x0001_0506);
+            let (ia, ib, _) = response_isns(&rcv, &snd, true).unwrap();
+            assert_eq!((ia, ib), (snd.hs.isn, snd.hs.isn));
+        }
     }
 
     /// `p` with a KM of this cipher (2 = CTR) and key length in bytes.

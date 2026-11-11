@@ -20,10 +20,10 @@ in Kubernetes: Strom and the outside world both connect *out* to one public
 UDP port, and Strom needs no listener port of its own. It does not depend
 on Strom.
 
-**Tested with:** libsrt 1.5 (`srt-live-transmit`, GStreamer `srtsrc`/`srtsink`
-in Strom, ffmpeg/ffplay, VLC 3.0.24) and the Rust `srt-protocol` crate.
-Other implementations (OBS, vMix, hardware encoders, gosrt, libsrt 1.4 and
-older) have not been tested yet. SRT implementations differ in how they read
+**Tested with:** libsrt 1.4 and 1.5 (`srt-live-transmit`, GStreamer
+`srtsrc`/`srtsink` in Strom, ffmpeg/ffplay, VLC 3.0.24) and the Rust
+`srt-protocol` crate. Other implementations (OBS, vMix, hardware encoders,
+gosrt, libsrt 1.3 and older) have not been tested yet. SRT implementations differ in how they read
 the handshake, so interop reports are welcome. See
 [docs/TESTING.md](docs/TESTING.md).
 
@@ -121,6 +121,9 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
   the same instance. Scale out with several relays, each with its own public
   address.
 - AES-GCM is untested, though nothing it authenticates is rewritten.
+- libsrt 1.5.0–1.5.2 can send through the relay but not receive; a receiver
+  on those versions needs 1.5.3+ or 1.4.x
+  ([why](docs/DESIGN.md#libsrt-150-to-152-as-receiver)).
 
 What has been tested, and how: [docs/TESTING.md](docs/TESTING.md).
 
