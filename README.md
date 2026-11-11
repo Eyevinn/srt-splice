@@ -62,9 +62,11 @@ To build from source: `cargo build --release` (std only, no dependencies).
 - **Direction (recommended):** a caller may state its role with the SRT
   access-control syntax, `#!::r=<id>,m=publish` (I send) or
   `#!::r=<id>,m=request` (I receive). It pairs on `r`, so it pairs with a
-  plain `<id>` from the other side. The relay uses the direction to set up
-  the session in a way every SRT implementation accepts. In a URI, encode
-  it: `streamid=%23!%3A%3Ar%3Dcam1%2Cm%3Drequest`.
+  plain `<id>` from the other side. With a direction, the sender sees the
+  same handshake answer a normal listener would give it, so the relay does
+  not depend on how a particular implementation reads it (see
+  [docs/DESIGN.md](docs/DESIGN.md#isn-and-direction)). In a URI, encode it:
+  `streamid=%23!%3A%3Ar%3Dcam1%2Cm%3Drequest`.
 
 How this works in detail: [docs/DESIGN.md](docs/DESIGN.md).
 
