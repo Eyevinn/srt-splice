@@ -163,10 +163,40 @@ const MAX_WAITING: usize = 4;
 /// How long a replaced attempt is ignored, so it cannot take the place back.
 const REPLACED_TTL: Duration = Duration::from_secs(5);
 
+/// Why two callers' encryption settings cannot work end to end, as the
+/// rejection reason libsrt itself would give. `None` = they match: a KM on
+/// both sides with the same cipher and key length, or on neither.
+fn crypto_mismatch(a: &Party, b: &Party) -> Option<(u32, &'static str)> {
+    match (a.hs.km(), b.hs.km()) {
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => Some((REJ_UNSECURE, "encrypted on one side only")),
+        (Some(ka), Some(kb)) => {
+            let (pa, pb) = (km_params(ka), km_params(kb));
+            if pa == pb {
+                None
+            } else if pa.map(|k| k.0) != pb.map(|k| k.0) {
+                Some((REJ_CRYPTO, "different cipher"))
+            } else {
+                Some((REJ_BADSECRET, "different key length"))
+            }
+        }
+    }
+}
+
 /// Whether two waiting callers may be paired: never two that state the
-/// same role (two `m=request` are one receiver reconnecting, or a mistake).
+/// same role (two `m=request` are one receiver reconnecting, or a mistake),
+/// and never two whose encryption settings do not match.
 fn compatible(a: &Party, b: &Party) -> bool {
-    sender(a.mode, b.mode).is_ok()
+    sender(a.mode, b.mode).is_ok() && crypto_mismatch(a, b).is_none()
+}
+
+/// `(a, b)` ordered by arrival: the caller that arrived first comes first.
+fn oldest_first<P: std::borrow::Borrow<Party>>(a: P, b: P) -> (P, P) {
+    if a.borrow().arrived <= b.borrow().arrived {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
 /// Whether `a` and `b` are both known to be there: the older of the two
@@ -174,12 +204,77 @@ fn compatible(a: &Party, b: &Party) -> bool {
 /// gave up, or a caller's own earlier attempt before it reconnected from a
 /// new port, never repeats, so it is never paired.
 fn both_alive(a: &Party, b: &Party, now: Instant) -> bool {
-    let (old, new) = if a.arrived <= b.arrived {
-        (a, b)
-    } else {
-        (b, a)
-    };
+    let (old, new) = oldest_first(a, b);
     old.last_seen > new.arrived && new.alive(now) && old.alive(now)
+}
+
+/// The best peer for `waiting[i]`, which has just repeated its conclusion:
+/// the compatible one, known to be alive, heard from most recently.
+fn best_peer(waiting: &[Party], i: usize, now: Instant) -> Option<usize> {
+    let x = &waiting[i];
+    waiting
+        .iter()
+        .enumerate()
+        .filter(|(j, y)| *j != i && compatible(x, y) && both_alive(x, y, now))
+        .max_by_key(|(_, y)| y.last_seen)
+        .map(|(j, _)| j)
+}
+
+/// What to do with a new caller (not a repeat) on a streamid where
+/// `waiting` callers already wait.
+#[derive(Debug, PartialEq, Eq)]
+enum Admit {
+    /// Add it to the waiting callers.
+    Wait,
+    /// It is the caller of `waiting[i]` reconnecting: it takes that place.
+    Replace(usize),
+    /// Refuse it with this reason.
+    Reject(u32, String),
+}
+
+/// Admission of a new caller. Only waiting callers it could actually pair
+/// with count against it, so a stray with the wrong encryption settings
+/// can neither take a place nor block a correctly configured caller.
+///
+/// - Same role as a waiting caller with matching encryption: from the same
+///   host it is that caller reconnecting (a new port after its connect
+///   timeout) and replaces it; from another host while the first is alive,
+///   it is a second sender or receiver and is rejected (1409).
+/// - A clear caller where every waiting caller of a compatible role is
+///   encrypted is refused with `SRT_REJ_UNSECURE`, as a listener with a
+///   passphrase would. Encrypted callers are never refused for a mismatch:
+///   the relay cannot tell which side is the stray, and refusing them would
+///   let whoever came first block the session. Without a passphrase the
+///   streamid is the only protection anyway.
+fn admit(waiting: &[Party], new: &Party, now: Instant) -> Admit {
+    if new.mode != Mode::Unknown {
+        let same_role = waiting
+            .iter()
+            .position(|c| c.mode == new.mode && crypto_mismatch(c, new).is_none());
+        if let Some(i) = same_role {
+            let c = &waiting[i];
+            if c.addr.ip() != new.addr.ip() && c.alive(now) {
+                return Admit::Reject(
+                    REJX_CONFLICT,
+                    format!("another m={:?} is waiting", new.mode),
+                );
+            }
+            return Admit::Replace(i);
+        }
+    }
+    if new.hs.km().is_none() {
+        let mut peers = waiting
+            .iter()
+            .filter(|c| c.alive(now) && sender(c.mode, new.mode).is_ok())
+            .peekable();
+        if peers.peek().is_some() && peers.all(|c| c.hs.km().is_some()) {
+            return Admit::Reject(REJ_UNSECURE, "the waiting peer is encrypted".into());
+        }
+    }
+    if waiting.len() >= MAX_WAITING {
+        return Admit::Reject(REJX_CONFLICT, "too many callers waiting".into());
+    }
+    Admit::Wait
 }
 
 struct Inject {
@@ -417,64 +512,45 @@ impl Relay {
             // A repeat: refresh it, then pair with the best live peer.
             party.arrived = waiting[i].arrived;
             waiting[i] = party;
-            let x = &waiting[i];
-            let peer = waiting
-                .iter()
-                .enumerate()
-                .filter(|(j, y)| *j != i && compatible(x, y) && both_alive(x, y, now))
-                .max_by_key(|(_, y)| y.last_seen)
-                .map(|(j, _)| j);
-            if let Some(j) = peer {
+            if let Some(j) = best_peer(waiting, i, now) {
                 let (hi, lo) = (i.max(j), i.min(j));
                 let a = waiting.remove(hi);
                 let b = waiting.remove(lo);
                 if waiting.is_empty() {
                     self.pending.remove(&sid);
                 }
-                self.pair(b, a);
+                self.pair(a, b);
             }
             return;
         }
-        // A new caller stating the same role as a waiting one. From the
-        // same host it is that caller reconnecting (a new port after its
-        // connect timeout): it replaces the old attempt, which is then
-        // ignored for a while so it cannot take the place back. From
-        // another host while the first is alive, it is a second sender or
-        // receiver: rejected.
-        if mode != Mode::Unknown {
-            if let Some(i) = waiting.iter().position(|c| c.mode == mode) {
-                let (old_addr, old_alive) = (waiting[i].addr, waiting[i].alive(now));
-                if old_addr.ip() != from.ip() && old_alive {
-                    return self.reject(
-                        from,
-                        &party.hs,
-                        REJX_CONFLICT,
-                        &format!("streamid {sid:?}: another m={mode:?} is waiting"),
-                    );
+        match admit(waiting, &party, now) {
+            Admit::Reject(code, why) => {
+                if waiting.is_empty() {
+                    self.pending.remove(&sid);
                 }
-                waiting.remove(i);
+                return self.reject(from, &party.hs, code, &format!("streamid {sid:?}: {why}"));
+            }
+            Admit::Replace(i) => {
+                let old_addr = waiting.remove(i).addr;
                 self.replaced.insert(old_addr, now);
                 log!(
                     self,
                     "[{sid}] {from} replaces {old_addr} (same role {mode:?})"
                 );
             }
+            Admit::Wait => {}
         }
-        let waiting = self.pending.get_mut(&sid).unwrap();
-        if waiting.len() >= MAX_WAITING {
-            return self.reject(
-                from,
-                &party.hs,
-                REJX_CONFLICT,
-                &format!("streamid {sid:?}: too many callers waiting"),
-            );
-        }
+        let waiting = &self.pending[&sid];
         let what = if waiting.is_empty() {
-            "waiting for a peer"
+            "waiting for a peer".into()
+        } else if waiting.iter().any(|c| compatible(c, &party)) {
+            "waiting; pairs once both have repeated".into()
+        } else if let Some((_, why)) = waiting.iter().find_map(|c| crypto_mismatch(c, &party)) {
+            format!("waiting; no compatible peer yet ({why})")
         } else {
-            "waiting; pairs once both have repeated"
+            "waiting; no compatible peer yet".into()
         };
-        self.log_waiting(&party, what);
+        self.log_waiting(&party, &what);
         self.pending.get_mut(&sid).unwrap().push(party);
     }
 
@@ -498,40 +574,10 @@ impl Relay {
         self.secret.hash_one(a) as u32
     }
 
+    /// Pairs two compatible callers (see `compatible`).
     fn pair(&mut self, a: Party, b: Party) {
         let sid = a.sid.clone();
-        // On an encryption mismatch only the newer caller is refused: the one
-        // that waited keeps its place, so a stray or hostile caller that knows
-        // the id cannot knock the legitimate one out.
-        let (old, new) = if a.arrived <= b.arrived {
-            (a, b)
-        } else {
-            (b, a)
-        };
-        let (old_km, new_km) = (old.hs.km(), new.hs.km());
-        let mismatch = match (old_km, new_km) {
-            (Some(_), None) | (None, Some(_)) => Some((REJ_UNSECURE, "encrypted on one side only")),
-            (Some(ko), Some(kn)) if km_params(ko) != km_params(kn) => {
-                if km_params(ko).map(|k| k.0) != km_params(kn).map(|k| k.0) {
-                    Some((REJ_CRYPTO, "different cipher than the waiting peer"))
-                } else {
-                    Some((REJ_BADSECRET, "different key length than the waiting peer"))
-                }
-            }
-            _ => None,
-        };
-        if let Some((code, why)) = mismatch {
-            log!(
-                self,
-                "[{sid}] {} refused ({why}); {} keeps waiting",
-                new.addr,
-                old.addr
-            );
-            self.reject(new.addr, &new.hs, code, why);
-            self.pending.entry(sid).or_default().push(old);
-            return;
-        }
-        let (a, b) = (old, new);
+        let (a, b) = oldest_first(a, b);
         let a_km = a.hs.km();
         let Ok((isn_a, isn_b, how)) = response_isns(&a, &b, self.fingerprint) else {
             log!(self, "[{sid}] both sides m={:?}: rejecting both", a.mode);
@@ -887,6 +933,140 @@ mod tests {
         assert!(compatible(&req, &publ));
         assert!(compatible(&req, &any));
         assert!(compatible(&any, &party(5, Mode::Unknown, t, t)));
+    }
+
+    /// `p` with a KM of this cipher (2 = CTR) and key length in bytes.
+    fn enc(mut p: Party, cipher: u8, klen: u8) -> Party {
+        let mut km = vec![0u8; 32];
+        km[8] = cipher;
+        km[15] = klen / 4;
+        p.hs.exts.push(Ext {
+            cmd: CMD_KMREQ,
+            data: km,
+        });
+        p
+    }
+
+    /// `p` calling from another host.
+    fn from_host(mut p: Party, last_octet: u8) -> Party {
+        p.addr = SocketAddr::from(([127, 0, 0, last_octet], p.addr.port()));
+        p
+    }
+
+    #[test]
+    fn encryption_must_match_to_pair() {
+        let t = Instant::now();
+        let p = |port| party(port, Mode::Unknown, t, t);
+        assert!(compatible(&p(1), &p(2)));
+        assert!(compatible(&enc(p(1), 2, 16), &enc(p(2), 2, 16)));
+        assert!(!compatible(&enc(p(1), 2, 16), &p(2)));
+        assert!(!compatible(&p(1), &enc(p(2), 2, 16)));
+        assert!(!compatible(&enc(p(1), 2, 16), &enc(p(2), 2, 32)));
+        assert!(!compatible(&enc(p(1), 2, 16), &enc(p(2), 4, 16)));
+        assert_eq!(
+            crypto_mismatch(&enc(p(1), 2, 16), &enc(p(2), 4, 16))
+                .unwrap()
+                .0,
+            REJ_CRYPTO
+        );
+        assert_eq!(
+            crypto_mismatch(&enc(p(1), 2, 16), &enc(p(2), 2, 32))
+                .unwrap()
+                .0,
+            REJ_BADSECRET
+        );
+    }
+
+    #[test]
+    fn plain_pair_still_meets() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let rcv = party(1, Mode::Unknown, ms(0), ms(0));
+        let snd = party(2, Mode::Unknown, ms(1000), ms(1000));
+        let mut waiting = vec![rcv];
+        assert_eq!(admit(&waiting, &snd, ms(1000)), Admit::Wait);
+        waiting.push(snd);
+        waiting[0].last_seen = ms(1100);
+        assert_eq!(best_peer(&waiting, 0, ms(1100)), Some(1));
+    }
+
+    #[test]
+    fn stray_clear_caller_first_then_encrypted_pair_meets() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let stray = from_host(party(1, Mode::Unknown, ms(0), ms(0)), 9);
+        let rcv = enc(party(2, Mode::Unknown, ms(500), ms(500)), 2, 16);
+        let snd = enc(party(3, Mode::Unknown, ms(1000), ms(1000)), 2, 16);
+        let mut waiting = vec![stray];
+        // The encrypted receiver is not refused because of the stray.
+        assert_eq!(admit(&waiting, &rcv, ms(500)), Admit::Wait);
+        waiting.push(rcv);
+        assert_eq!(admit(&waiting, &snd, ms(1000)), Admit::Wait);
+        waiting.push(snd);
+        // Everyone repeats; the stray is the most recent, and never chosen.
+        waiting[1].last_seen = ms(1100);
+        waiting[2].last_seen = ms(1150);
+        waiting[0].last_seen = ms(1200);
+        assert_eq!(best_peer(&waiting, 0, ms(1200)), None);
+        assert_eq!(best_peer(&waiting, 1, ms(1200)), Some(2));
+        assert_eq!(best_peer(&waiting, 2, ms(1200)), Some(1));
+    }
+
+    #[test]
+    fn stray_clear_caller_after_encrypted_receiver_is_refused() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let rcv = enc(party(1, Mode::Unknown, ms(0), ms(400)), 2, 16);
+        let stray = from_host(party(2, Mode::Unknown, ms(500), ms(500)), 9);
+        let waiting = vec![rcv];
+        assert!(matches!(
+            admit(&waiting, &stray, ms(500)),
+            Admit::Reject(REJ_UNSECURE, _)
+        ));
+        // An encrypted caller with other settings is never refused: it
+        // cannot block a correctly configured one that comes later.
+        let other = enc(party(3, Mode::Unknown, ms(500), ms(500)), 2, 32);
+        assert_eq!(admit(&waiting, &other, ms(500)), Admit::Wait);
+        // Only waiting callers of a compatible role count: a clear m=request
+        // next to an encrypted m=request just waits.
+        let req = enc(party(4, Mode::Request, ms(0), ms(400)), 2, 16);
+        let clear_req = from_host(party(5, Mode::Request, ms(500), ms(500)), 9);
+        assert_eq!(admit(&[req], &clear_req, ms(500)), Admit::Wait);
+    }
+
+    #[test]
+    fn stray_does_not_block_same_role_caller() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        // A clear m=request from another host waits, repeating.
+        let stray = from_host(party(1, Mode::Request, ms(0), ms(400)), 9);
+        let rcv = enc(party(2, Mode::Request, ms(500), ms(500)), 2, 16);
+        let mut waiting = vec![stray];
+        // Not a 1409: the stray could never pair with the receiver's peer.
+        assert_eq!(admit(&waiting, &rcv, ms(500)), Admit::Wait);
+        waiting.push(rcv);
+        let snd = enc(party(3, Mode::Publish, ms(1000), ms(1000)), 2, 16);
+        assert_eq!(admit(&waiting, &snd, ms(1000)), Admit::Wait);
+        waiting.push(snd);
+        waiting[0].last_seen = ms(1100);
+        waiting[1].last_seen = ms(1100);
+        assert_eq!(best_peer(&waiting, 1, ms(1100)), Some(2));
+        assert_eq!(best_peer(&waiting, 0, ms(1100)), None);
+    }
+
+    #[test]
+    fn same_role_with_matching_encryption_conflicts_or_replaces() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let rcv = enc(party(1, Mode::Request, ms(0), ms(400)), 2, 16);
+        let waiting = vec![rcv];
+        let other_host = from_host(enc(party(2, Mode::Request, ms(500), ms(500)), 2, 16), 9);
+        assert!(matches!(
+            admit(&waiting, &other_host, ms(500)),
+            Admit::Reject(REJX_CONFLICT, _)
+        ));
+        let reconnect = enc(party(3, Mode::Request, ms(500), ms(500)), 2, 16);
+        assert_eq!(admit(&waiting, &reconnect, ms(500)), Admit::Replace(0));
     }
 
     #[test]

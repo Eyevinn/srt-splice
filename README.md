@@ -89,6 +89,18 @@ while the session is up is rejected with `SRT_REJX_CONFLICT` (1409). It can
 connect again once the session has ended. This holds in both directions: two
 senders cannot share a streamid either.
 
+Only callers whose encryption matches are paired: a KM on both sides with
+the same cipher and key length, or no encryption on either. A waiting caller
+with other settings is ignored for everyone else: it cannot pair with them
+and does not count against them (no 1409 because of it), so a correctly
+configured pair meets even if a stray caller with the wrong settings sits on
+the same streamid. A clear caller that finds only encrypted callers of a
+matching role waiting is refused with `SRT_REJ_UNSECURE`. Encrypted callers
+are never refused for a mismatch: the relay cannot tell which side is the
+stray, and refusing the later one would let whoever came first block the
+session. A wrong *passphrase* cannot be seen in the handshake at all (see
+[Findings](#findings)).
+
 The relay does not split streams. One source to several receivers needs a
 session per receiver, all the way to the source:
 
@@ -125,7 +137,8 @@ fingerprinting is needed.
   (callers retry from a new port after their connect timeout, as Strom's
   SRT blocks do every 3 s) and replaces the older attempt. From another
   host while the first is still waiting, it is rejected with
-  `SRT_REJX_CONFLICT` (1409).
+  `SRT_REJX_CONFLICT` (1409). Only a waiting caller with matching
+  encryption counts here.
 - No direction (plain streamids on both sides, or `m=bidirectional`):
   **fallback:** recognize srt-protocol by its HSREQ (see
   [Findings](#findings)), otherwise assume libsrt on both sides.
@@ -219,7 +232,8 @@ macOS, loopback, libsrt 1.5.6 `srt-live-transmit` and the Rust
 | Receiver with `conntimeo=1500` and auto-reconnect, sender joins after 4 s (the receiver has reconnected from new ports twice) | ✅ stale attempts are not paired, 0 lost |
 | **Strom 0.7.2** (Docker) in a loop: `ffmpeg` → relay `cam1` → Strom MPEG-TS/SRT Input (caller, `m=request`, passthrough) → Strom MPEG-TS/SRT Output (caller, `m=publish`) → relay `pgm` → receiver; AES-128, H.264 720p 4 Mbit/s | ✅ decodable H.264 out, 348 frames of 375. Strom's 3 s reconnects replace their own earlier attempts |
 | Wrong passphrase on one side | ✅ no data reaches the receiver. The injected key gets no KMRSP and the relay tears down after 3 s (could be faster) |
-| One side encrypted, other not | ✅ the newer caller is refused with `SRT_REJ_UNSECURE`; the one already waiting keeps its place, so a stray or hostile caller that knows the id cannot knock it out |
+| One side encrypted, other not | ✅ never paired. A clear caller that finds only encrypted callers waiting is refused with `SRT_REJ_UNSECURE` |
+| Stray clear caller on the id of an encrypted pair, before or between them | ✅ the encrypted pair meets (0 lost); the stray never pairs and does not hold a place against them (see [Pairing rule](#pairing-rule-one-streamid--one-session-11)) |
 | Rust `srt-protocol` 0.4.4 sender → libsrt receiver, plain + AES | ✅ after the ISN fix below |
 | Direction, `--no-fingerprint`: Rust sender → libsrt receiver `m=request` (Strom ingest) | ✅ |
 | Direction: libsrt ingest (`m=request`) / egress (`m=publish`), AES | ✅ / ✅ |
