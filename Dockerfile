@@ -14,8 +14,11 @@ USER 65534:65534
 # 9000/udp: SRT, the public port. 9001/tcp: the read-only HTTP API (/v1/info),
 # for the internal network only.
 EXPOSE 9000/udp 9001/tcp
+# Defaults, overridable with -e or CLI args. The binary's own API default is
+# loopback; in a container it has to listen on all interfaces to be reachable.
+ENV SRT_SPLICE_LISTEN=0.0.0.0:9000 \
+    SRT_SPLICE_API=0.0.0.0:9001
 # The relay keeps no state worth saving and has no signal handler. As PID 1 it
 # would ignore SIGTERM, so stop it with SIGKILL instead of waiting for a timeout.
 STOPSIGNAL SIGKILL
 ENTRYPOINT ["/srt-splice"]
-CMD ["--listen", "0.0.0.0:9000", "--api", "0.0.0.0:9001"]

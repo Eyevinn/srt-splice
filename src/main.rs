@@ -767,7 +767,7 @@ fn peer_ip_field(a: SocketAddr) -> [u8; 16] {
 fn main() {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let mut listen = env("SRT_SPLICE_LISTEN").unwrap_or_else(|| "0.0.0.0:9000".into());
-    let mut api_listen = env("SRT_SPLICE_API").unwrap_or_else(|| "0.0.0.0:9001".into());
+    let mut api_listen = env("SRT_SPLICE_API").unwrap_or_else(|| "127.0.0.1:9001".into());
     let mut public = env("SRT_SPLICE_PUBLIC");
     let mut verbose = false;
     let mut fingerprint = true;
@@ -810,15 +810,16 @@ fn main() {
                 srt_port,
             },
         ) {
-            Ok(()) => log!(
+            Ok(addr) => log!(
                 r,
-                "api on http://{api_listen} (public address: {})",
+                "api on http://{addr} (public address: {})",
                 public.as_deref().unwrap_or("not set, use --public")
             ),
-            Err(e) => {
-                log!(r, "api: cannot listen on {api_listen}: {e}");
-                std::process::exit(1);
-            }
+            // The API is a convenience: the relay runs on without it.
+            Err(e) => log!(
+                r,
+                "WARNING: api: cannot listen on {api_listen}: {e}; running without the API"
+            ),
         }
     }
     // The largest UDP payload, so nothing is ever forwarded truncated.

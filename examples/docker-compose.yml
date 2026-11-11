@@ -8,8 +8,12 @@ services:
   srt-splice:
     build: ..
     image: srt-splice:local
-    command: ["--listen", "0.0.0.0:9000", "--api", "0.0.0.0:9001", "-v"]
+    command: ["-v"]
     environment:
+      SRT_SPLICE_LISTEN: 0.0.0.0:9000
+      # All interfaces inside the container; the port mapping below keeps it
+      # on the host's loopback.
+      SRT_SPLICE_API: 0.0.0.0:9001
       SRT_SPLICE_PUBLIC: ${SRT_SPLICE_PUBLIC:-localhost:9000}
     ports:
       - "9000:9000/udp"

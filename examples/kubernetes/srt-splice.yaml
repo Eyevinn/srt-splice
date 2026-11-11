@@ -35,8 +35,13 @@ spec:
       containers:
         - name: srt-splice
           image: ghcr.io/eyevinn/srt-splice:latest  # pin a version tag in production
-          args: ["--listen", "0.0.0.0:9000", "--api", "0.0.0.0:9001"]
           env:
+            - name: SRT_SPLICE_LISTEN
+              value: 0.0.0.0:9000
+            # The read-only HTTP API (readiness probe, /v1/info). It must
+            # listen on the pod IP; keep it off the public Service.
+            - name: SRT_SPLICE_API
+              value: 0.0.0.0:9001
             # The address the outside world dials (your load balancer's DNS
             # name or IP and port). Reported on GET /v1/info.
             - name: SRT_SPLICE_PUBLIC

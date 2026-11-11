@@ -23,7 +23,7 @@ Strom and works with any SRT caller, in a local Docker Compose stack or
 anywhere else.
 
 > **Status: experimental.** This is a research spike: std-only Rust (no
-> dependencies), about 800 lines, one thread. It has been tested on loopback
+> dependencies), about 1200 lines, one relay thread. It has been tested on loopback
 > with libsrt and the Rust `srt-protocol` crate (see [Results](#results)). It
 > is not production code yet. Feedback and interop reports are welcome.
 
@@ -47,12 +47,13 @@ docker run --rm -p 9000:9000/udp srt-splice
 docker compose -f examples/docker-compose.yml up --build
 ```
 
-Options (environment variable in brackets):
+Options (environment variable in brackets; a command-line option wins over
+the variable):
 
 | Option | Default | |
 |---|---|---|
 | `--listen ADDR:PORT`, `-l` (`SRT_SPLICE_LISTEN`) | `0.0.0.0:9000` | The SRT UDP port, the one exposed publicly. |
-| `--api ADDR:PORT\|off` (`SRT_SPLICE_API`) | `0.0.0.0:9001` | Read-only HTTP API, **internal network only**. |
+| `--api ADDR:PORT\|off` (`SRT_SPLICE_API`) | `127.0.0.1:9001` | Read-only HTTP API, **internal network only**. The image sets `0.0.0.0:9001`. If the address cannot be bound, the relay logs a warning and runs without the API. |
 | `--public HOST:PORT` (`SRT_SPLICE_PUBLIC`) | unset | The address the outside world dials, reported by the API. |
 | `--no-fingerprint` | off | See [Direction](#direction-mpublish--mrequest). |
 | `-v` | off | Log per-session stats every 5 s. |
@@ -66,6 +67,10 @@ public network.
 - `GET /v1/info` → `{"version":"0.0.1","public":"srt.example.com:9000","srt_port":9000}`
   (`public` is `null` when `--public` is not set)
 - `GET /healthz` → `ok`
+
+Each connection is handled on its own thread with a 1 s deadline for the
+whole request, at most 32 at a time, so a slow client cannot hold up a
+readiness probe.
 
 Then start a receiver and a sender in either order, with the same streamid.
 Use a long random streamid and a passphrase (see [Security](#security)):
