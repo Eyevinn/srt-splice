@@ -22,10 +22,18 @@ the container, for the readiness probe.
 
 - **One replica per relay.** The two callers of a session are paired inside
   one process. If they reached different pods they would never meet.
-- **`externalTrafficPolicy: Local`.** The relay tells the legs of a session
-  apart by their UDP source address, so it must see the real client
-  addresses. With the default policy, nodes may SNAT incoming packets. Check
-  your cloud provider's documentation for UDP load balancers.
+- **`externalTrafficPolicy: Local` (recommended).** It keeps the real
+  client addresses. With the default (`Cluster`) policy, nodes may SNAT
+  incoming packets to a node address. That still works: each leg keeps its
+  own address and port after SNAT, and that is all the relay needs to tell
+  the legs apart. What you lose:
+  - the logs show node addresses, not the real callers;
+  - the role rule's "same host = the caller reconnecting" (see
+    [DESIGN.md](DESIGN.md#pairing-rules)) sees every caller behind one SNAT
+    address as one host. A second caller with the same role on a waiting
+    streamid then *replaces* the first instead of being refused with 1409.
+    With long random streamids that only matters if one leaks.
+  See also [Load balancer](#load-balancer).
 - **Readiness:** `GET /healthz` on the health port.
 - **Strom in the same cluster:** `STROM_SRT_RELAY=<public host:port>` (the
   load balancer's address, shown to the outside party) and
@@ -37,6 +45,51 @@ the container, for the readiness probe.
 have the service that hands out addresses (for example Strom) choose one per
 session. A load balancer cannot route on the streamid: it is inside the SRT
 handshake, not in the UDP header.
+
+## Load balancer
+
+The load balancer (or whatever forwards the public port) must:
+- **support UDP**, and keep each flow (client address and port) on the
+  same backend for as long as it sends;
+- **pass the packets through** (layer 4). The relay changes nothing in
+  them, and needs nothing from the load balancer but the packets.
+
+Ideally it also **preserves the client address**. A load balancer that
+proxies UDP (one that re-sends each flow from its own address) still
+works, for the same reason as SNAT above, with the same caveats: the logs
+show the load balancer, and callers look like one host to the role rule.
+
+**OpenStack** (for example managed Kubernetes on OpenStack, with Octavia
+as the load balancer): check what your Octavia provider does. Octavia has
+UDP listeners, but whether the client address reaches the pod depends on
+the provider (the OVN provider forwards at layer 4 with DNAT; the amphora
+provider uses LVS for UDP) and on `externalTrafficPolicy`. Check it: with
+`-v`, the relay logs the address of every caller. If the load balancer does
+not fit, expose the relay on a NodePort, or run it with `hostNetwork`, and
+give that node a floating IP: the relay then sees the callers directly.
+
+## MTU
+
+A typical MPEG-TS stream over SRT sends 1316-byte payloads (7 TS packets),
+which are 1360-byte IP packets with the SRT, UDP and IP headers. That fits an overlay
+network with a 1450-byte MTU (VXLAN), as most Kubernetes pod networks are.
+Larger payloads may not: a larger `payloadsize`, file mode, or
+`srt-live-transmit`, whose default chunk is 1456 bytes (1500-byte
+packets): the relay
+cannot forward a packet larger than the pod's MTU (it logs
+`Message too long`), or it is fragmented on the way. Set `--max-mss` (`SRT_SPLICE_MAX_MSS`), for example
+to 1450 on VXLAN, to grant the callers a smaller MSS in the handshake, so
+they never send larger packets (the MSS counts the whole IP packet,
+like the MTU). A caller whose payload size does not fit
+the granted MSS then fails visibly when it connects or sends, instead of
+losing packets on the way. Valid values: 76 to 1500.
+
+## IPv4 only
+
+The relay listens on IPv4 (`0.0.0.0:9000` by default) and has only been
+tested on IPv4. Callers that only have IPv6, for example IPv6 clients of a dual-stack cluster or load
+balancer, cannot reach it. Give the Service an IPv4 address
+(`ipFamilies: [IPv4]`, the default in single-stack clusters).
 
 ## Docker Compose
 

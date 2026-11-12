@@ -4,7 +4,8 @@
 
 `cargo test` covers the wire format, the pairing rules (liveness, callers
 that do not repeat their conclusion, roles, encryption compatibility,
-reconnects, the libsrt 1.5.0–1.5.2 receiver guard), the fingerprints,
+reconnects, the libsrt 1.5.0–1.5.2 receiver guard), moving a leg to a
+new address (NAT rebinding) and what may not, the MSS cap, the fingerprints,
 which side gets the key update, the streamid parsing and the health endpoint.
 
 ## Interop and end-to-end results
@@ -39,6 +40,10 @@ macOS, loopback, libsrt 1.5.6 `srt-live-transmit` and the Rust
 | gosrt 0.13 receiver from libsrt, clear, with and without `m=publish`, gosrt waiting first or arriving second | ✅ 0 lost; waiting first, it is paired when the sender arrives (gosrt does not repeat its conclusion) |
 | gosrt 0.13 to gosrt 0.13, clear, no direction | ✅ 0 lost; neither repeats its conclusion, so they pair when the second arrives |
 | gosrt 0.13 receiver, AES | ❌ as expected: gosrt does not take the injected key (see [DESIGN.md](DESIGN.md#gosrt)); with a direction the relay tears down after 3 s |
+| NAT rebinding: the sender's source port changes mid-stream (a UDP forwarder opens a new outbound socket after 3 s), AES-128, latency 120 ms | ✅ 0 lost; the leg moved 500 ms after the switch (the quiet time); the stall shows as p99 596 ms |
+| NAT rebinding of the receiver (switch after 4 s), AES-128, latency 120 ms | ✅ 0 lost, p99 1096 ms |
+| NAT rebinding, sender and receiver, latency 1000 ms | ✅ 0 lost, p99 1052 / 1051 ms: the stall is hidden |
+| `--max-mss 1400`, AES-128 | ✅ granted 1400 to both sides (in the PAIR log), 0 lost with 1316-byte payloads (`-chunk:1316`). With `srt-live-transmit`'s default 1456-byte chunks the sender refuses each message ("can't fit into a single data packet (1356 bytes max)"), as expected |
 | AES-GCM | ⚠️ untested: Homebrew's libsrt is built without `ENABLE_AEAD_API_PREVIEW` and silently uses CTR |
 
 The libsrt 1.4 and 1.5.1 cases ran in Docker (colima) on macOS against the
@@ -47,6 +52,11 @@ libsrt 1.5.7 on the other side. Their `srt-live-transmit` does not
 URL-decode the streamid: pass `#!::r=…,m=…` unencoded there. gosrt ran the
 same way, as its `client` example (`-from`/`-to`) from v0.13.0. libsrt 1.3.x is
 not tested (no distro package).
+
+The rebinding cases ran with `SEND_VIA` / `RCV_VIA` pointing at a small
+UDP forwarder (not in this repository) that forwards a caller's packets to
+the relay from one socket, and after N seconds closes it and continues from
+a new one, as a NAT that gives the flow a new port.
 
 The `max=5000 ms` latency some measurements show is an artifact of the
 tools at shutdown. A direct connection without the relay shows the same.
@@ -75,7 +85,6 @@ RELAY=127.0.0.1:9900 MEASURE_TOOL=/path/to/tool \
 - AES-GCM.
 - Bidirectional data (both sides sending).
 - IPv6.
-- A peer whose port changes mid-session (NAT rebinding).
 - libsrt 1.3 and older, hardware encoders.
 - srt-protocol as the receiver.
 - Load: many sessions and high bitrates on one relay.

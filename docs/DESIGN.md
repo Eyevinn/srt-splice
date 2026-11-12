@@ -42,7 +42,8 @@ other caller's parameters, which is described below.
      the whole 16-byte header, so this matters.
    - **ISN**, so sequence numbers, and with them the AES counter, need no
      rewriting. See [ISN and direction](#isn-and-direction).
-   - SRT version and flags, the flow window, and the smaller MSS.
+   - SRT version and flags, the flow window, and the smaller MSS, capped
+     at `--max-mss` if set (see [MSS](#mss)).
    - **latency**: the largest of the four values both sides asked for, in
      both fields.
    - **the handshake timestamp on the other side's clock**, so TSBPD gets
@@ -88,6 +89,85 @@ other caller's parameters, which is described below.
     [Findings](#findings).
 - **1:1:** while a session is up, another caller on its streamid is refused
   with 1409.
+
+## Address changes (NAT rebinding)
+
+The relay knows each leg by its caller's UDP address. Some NATs (mobile
+networks, some home and carrier-grade NATs) give a long-running flow a new
+public port, or address, mid-session. The caller does not notice, but its
+packets now come from an address the relay does not know.
+
+Every SRT packet carries the destination socket id in its header (bytes
+12..16), and every packet a caller sends is addressed to its peer's socket
+id, which the relay put in that caller's conclusion response. So a packet
+from an unknown address whose destination socket id belongs to an
+established leg is most likely that leg's caller from its new address. The
+relay then moves the leg: the leg's address and the peer's return address
+both change, it logs `<old> moved to <new>`, and forwards the packet. The
+peer's packets go to the new address from then on.
+
+Conditions, all required:
+- **Not a handshake.** A handshake from a new address is a new caller, and
+  goes through the normal handshake (cookie, pairing, `1409` while the
+  session is up).
+- **A plausible session packet:** data, or a known control type.
+- **Exactly one leg** expects that destination socket id. If several do
+  (see [Socket id collisions](#socket-id-collisions)), none is moved and the
+  packet is dropped as a stray.
+- **The same IP family** as before.
+- **The old address has been silent for 500 ms.** A healthy leg is never
+  silent that long while media flows: the receiver ACKs every 10 ms, and
+  the sender sends at its bitrate (a packet every ~160 ms even for 64 kbit/s
+  audio alone). After a real rebinding the old address goes silent at once,
+  so this costs at most 500 ms. Moving at once would have no gap, but then
+  any packet with the right socket id would take over a leg that is still
+  sending, and packets still in flight from the old address would move it
+  back and forth.
+
+**The cost** is a stall of about 500 ms. In the tests (see
+[TESTING.md](TESTING.md)) libsrt recovered every packet even at the
+default 120 ms latency, delivering them up to about 1 s late; a latency
+above about 500 ms plus the round trip hides it completely. A shorter
+threshold (50 ms worked in tests too) would shorten the stall, but would
+let a guessed socket id take over a low-bitrate leg between its packets.
+
+**Residual risk.** The socket ids are the callers' own random values, not
+assigned by the relay (libsrt draws about 30 random bits), and the relay
+never sends them anywhere but to the two callers. An off-path attacker has
+to guess one, and a guess only works on a leg that has been silent for
+500 ms: one with no media flowing (only a keepalive every second), or one
+whose caller really is gone (until the 5 s idle timeout). An attacker who succeeds receives that leg's packets, which
+are encrypted with a passphrase, and the session breaks, as it would
+anyway if they could spoof the caller's address. When the real caller sends
+again, its packets come from an address the relay does not know, and take
+the leg back once the attacker has been silent for 500 ms. Someone who can
+see the traffic (on the path) learns the socket ids and can move a silent
+leg; they could also drop or spoof the packets. The relay does not
+authenticate packets; the passphrase protects the content end to end.
+
+### Socket id collisions
+
+libsrt draws a random start value in about 2^30 once per process and
+counts down for each new socket, so two sockets of one process never share
+an id; ids can only collide between processes. For N legs at a time on one
+relay, the chance that any two expect the same id is about
+N² / (2 · 2^30): about 1 in 2,000 for 1,000 legs (500 sessions).
+
+A collision does not matter for forwarding, which is keyed by the callers'
+addresses. It only matters if one of the colliding legs also changes its
+address: the id is then ambiguous, the relay does not move either leg, and
+that session is lost as it was before rebinding was supported. Media is
+never sent to the wrong session.
+
+## MSS
+
+The relay grants each caller the smaller of the two MSS values (the
+largest IP packet SRT will send, including the 28-byte IP/UDP and 16-byte
+SRT headers; libsrt asks for 1500). `--max-mss N` caps it, for a path
+with a smaller MTU than the callers know about, such as an overlay network
+inside a cluster (VXLAN: 1450). By default there is no cap: the callers'
+own values stand, as with a direct connection. See
+[DEPLOYMENT.md](DEPLOYMENT.md#mtu).
 
 ## Encryption
 

@@ -14,12 +14,14 @@
 # env:   MEASURE_TOOL=/path/to/measuring-tool (or `srt-spike` on PATH; SPIKE= also works)
 #        RELAY=127.0.0.1:9000  SID=<name>  SENDER=libsrt|rust
 #        SEND_VIA=host:port (e.g. a loss/delay proxy in front of the relay)
+#        RCV_VIA=host:port (the same for the receiver)
 #        GAP=1 (seconds between receiver and sender start)
 #        SND_SID / RCV_SID: per-side streamid (URL-encoded), default SID
 set -u
 NAME=$1; SQ=$2; RQ=$3; SECS=${4:-8}
 RELAY=${RELAY:-127.0.0.1:9000}
 SEND_VIA=${SEND_VIA:-$RELAY}
+RCV_VIA=${RCV_VIA:-$RELAY}
 SID=${SID:-$NAME}
 TOOL=$(command -v "${MEASURE_TOOL:-${SPIKE:-srt-spike}}" || true)
 if [ -z "$TOOL" ]; then
@@ -33,7 +35,7 @@ amp() { [ -n "$1" ] && echo "&$1"; }
 
 echo "=== $NAME"
 srt-live-transmit -a:no -t:$((SECS + 6)) -ll:error \
-  "srt://$RELAY?streamid=${RCV_SID:-$SID}&conntimeo=10000$(amp "$RQ")" file://con 2>"$OUT/$NAME.rcv.log" \
+  "srt://$RCV_VIA?streamid=${RCV_SID:-$SID}&conntimeo=10000$(amp "$RQ")" file://con 2>"$OUT/$NAME.rcv.log" \
   | "$TOOL" measure --quiet >"$OUT/$NAME.measure" &
 RCV=$!
 sleep "${GAP:-1}"

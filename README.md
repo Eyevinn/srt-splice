@@ -99,6 +99,7 @@ How this works in detail: [docs/DESIGN.md](docs/DESIGN.md).
 |---|---|---|
 | `--listen`, `-l` (`SRT_SPLICE_LISTEN`) | `0.0.0.0:9000` | The SRT UDP port, the one exposed publicly. |
 | `--health` (`SRT_SPLICE_HEALTH`) | `127.0.0.1:9001` (image: `0.0.0.0:9001`) | HTTP health endpoint for probes, `off` to disable. Internal network only. |
+| `--max-mss` (`SRT_SPLICE_MAX_MSS`) | no cap | Cap the MSS granted to callers (76–1500), e.g. 1450 on a VXLAN pod network. See [MTU](docs/DEPLOYMENT.md#mtu). |
 | `--no-fingerprint` | off | Without a stated direction, do not guess the caller's SRT implementation. |
 | `-v` | off | Log per-session stats every 5 s. |
 
@@ -156,6 +157,15 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
   ([why](docs/DESIGN.md#gosrt)). Clear streams, and gosrt as a sender, work.
 - A wrong passphrase is detected (and the session closed) only when the
   direction is stated; without it the relay just logs a warning.
+- IPv4 only: IPv6 callers (for example of a dual-stack cluster) cannot
+  reach the relay.
+- No path MTU discovery: typical MPEG-TS over SRT (1316-byte payloads)
+  fits a 1450-byte overlay MTU; for larger payloads, cap the MSS with
+  `--max-mss` ([MTU](docs/DEPLOYMENT.md#mtu)).
+- A caller whose address changes mid-session (NAT rebinding) keeps its
+  session, after a stall of about 500 ms (no loss in tests; a latency above
+  that hides it)
+  ([how](docs/DESIGN.md#address-changes-nat-rebinding)).
 
 What has been tested, and how: [docs/TESTING.md](docs/TESTING.md).
 

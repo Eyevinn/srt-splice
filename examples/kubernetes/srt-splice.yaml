@@ -5,12 +5,16 @@
 # callers must reach the same pod. Scaling out needs streamid-aware routing,
 # which this example does not have.
 #
-# Why externalTrafficPolicy: Local: the relay identifies each leg of a session
-# by its UDP source address. With the default (Cluster) policy, nodes may SNAT
-# incoming packets, so callers can look like they come from a node address and
-# the legs get mixed up. Local keeps the real client address. Whether the
-# client address survives also depends on your load balancer: check your
-# cloud provider's documentation for UDP.
+# Why externalTrafficPolicy: Local: it keeps the real client address. With the
+# default (Cluster) policy, nodes may SNAT incoming packets to a node address.
+# Pairing still works (each leg keeps a unique address and port), but the logs
+# show node addresses, and callers behind one SNAT address look like one host:
+# a second caller with the same role on a waiting streamid replaces the first
+# instead of being refused. Whether the client address survives also depends
+# on your load balancer (it must support UDP): see docs/DEPLOYMENT.md.
+#
+# Overlay pod network with a smaller MTU (VXLAN: 1450)? Typical MPEG-TS over
+# SRT fits; for larger payloads set SRT_SPLICE_MAX_MSS (see docs/DEPLOYMENT.md).
 #
 # Replace the image with one you have built and pushed (see Dockerfile).
 apiVersion: apps/v1
@@ -42,6 +46,9 @@ spec:
             # the pod IP; no Service exposes it.
             - name: SRT_SPLICE_HEALTH
               value: 0.0.0.0:9001
+            # Cap the MSS granted to callers, e.g. for a VXLAN pod network.
+            # - name: SRT_SPLICE_MAX_MSS
+            #   value: "1450"
           ports:
             - name: srt
               containerPort: 9000
@@ -76,6 +83,8 @@ metadata:
 spec:
   type: LoadBalancer
   externalTrafficPolicy: Local
+  # The relay listens on IPv4 only.
+  ipFamilies: [IPv4]
   selector:
     app.kubernetes.io/name: srt-splice
   ports:

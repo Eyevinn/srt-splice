@@ -43,6 +43,18 @@ const TICK: Duration = Duration::from_millis(20);
 const KM_RETRY: Duration = Duration::from_millis(100);
 const KM_TRIES: u32 = 30;
 const STATS_EVERY: Duration = Duration::from_secs(5);
+/// A leg moves to a new address (NAT rebinding) only after its current
+/// address has been silent this long. A healthy leg is never silent that
+/// long while media flows: the receiver ACKs every 10 ms, and a sender sends
+/// at its bitrate (even a 64 kbit/s audio-only stream sends a packet every
+/// ~160 ms). So packets from anyone else who learned the socket id, or late
+/// packets from the old address, cannot take over a leg that is still
+/// sending. The price: a real rebinding loses up to this much media unless
+/// the SRT latency covers it. See docs/DESIGN.md.
+const REBIND_QUIET: Duration = Duration::from_millis(500);
+/// The smallest and largest MSS `--max-mss` accepts. 76 is libsrt's own
+/// minimum; above 1500 there is no cap to speak of on the internet.
+const MSS_RANGE: std::ops::RangeInclusive<u32> = 76..=1500;
 
 /// The `m` key of an access-control streamid: this caller's own role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -412,7 +424,13 @@ struct Stats {
 struct Leg {
     sid: String,
     peer: SocketAddr,
+    /// This caller's own socket id: the destination of packets to it.
     socket_id: u32,
+    /// The peer's socket id: the destination of every packet this caller
+    /// sends. It identifies the leg when the caller's address changes.
+    peer_socket_id: u32,
+    /// The last address a rebind was refused for (logged once).
+    refused_from: Option<SocketAddr>,
     encrypted: bool,
     /// Our conclusion response, resent if the caller repeats its conclusion.
     response: Vec<u8>,
@@ -438,6 +456,12 @@ struct Relay {
     /// Attempts replaced by a reconnect of the same caller; ignored a while.
     replaced: HashMap<SocketAddr, Instant>,
     legs: HashMap<SocketAddr, Leg>,
+    /// Established legs by the destination socket id of the packets their
+    /// caller sends (`Leg::peer_socket_id`), to find a leg whose caller's
+    /// address has changed. Usually one address per id.
+    by_dest: HashMap<u32, Vec<SocketAddr>>,
+    /// Cap on the MSS granted in conclusion responses (`--max-mss`).
+    max_mss: Option<u32>,
 }
 
 macro_rules! log {
@@ -447,6 +471,21 @@ macro_rules! log {
 }
 
 impl Relay {
+    fn new(sock: UdpSocket, verbose: bool, fingerprint: bool, max_mss: Option<u32>) -> Relay {
+        Relay {
+            sock,
+            verbose,
+            fingerprint,
+            t0: Instant::now(),
+            secret: RandomState::new(),
+            pending: HashMap::new(),
+            replaced: HashMap::new(),
+            legs: HashMap::new(),
+            by_dest: HashMap::new(),
+            max_mss,
+        }
+    }
+
     fn send(&self, to: SocketAddr, p: &[u8]) {
         if let Err(e) = self.sock.send_to(p, to) {
             log!(self, "send to {to}: {e}");
@@ -460,12 +499,13 @@ impl Relay {
         if is_control(p) && ctrl_type(p) == CTRL_HANDSHAKE {
             return self.on_handshake(from, p);
         }
-        let Some(leg) = self.legs.get_mut(&from) else {
+        if !self.legs.contains_key(&from) && !self.rebind(from, p) {
             if self.verbose {
                 log!(self, "{from}: stray packet ({} bytes), no session", p.len());
             }
             return;
-        };
+        }
+        let leg = self.legs.get_mut(&from).unwrap();
         leg.last_rx = Instant::now();
         leg.stats.pkts += 1;
         leg.stats.bytes += p.len() as u64;
@@ -516,6 +556,61 @@ impl Relay {
             s.first_seq.get_or_insert(seq);
             s.last_seq = seq;
             self.send(peer, p);
+        }
+    }
+
+    /// NAT rebinding: a packet (not a handshake) from an unknown address
+    /// whose destination socket id belongs to exactly one established leg
+    /// moves that leg to the new address, if `rebind_allowed`. Returns
+    /// whether it did.
+    fn rebind(&mut self, from: SocketAddr, p: &[u8]) -> bool {
+        let dest = dest_socket_id(p);
+        let Some(&[old]) = self.by_dest.get(&dest).map(Vec::as_slice) else {
+            return false;
+        };
+        let leg = self.legs.get_mut(&old).unwrap();
+        if let Err(why) = rebind_allowed(old, leg.last_rx, from, p, Instant::now()) {
+            // Once per new address, not per packet.
+            if self.verbose && leg.refused_from.replace(from) != Some(from) {
+                let leg = &self.legs[&old];
+                log!(
+                    self,
+                    "[{}] {from}: packet for {old}'s session not taken ({why})",
+                    leg.sid
+                );
+            }
+            return false;
+        }
+        let mut leg = self.legs.remove(&old).unwrap();
+        leg.refused_from = None;
+        log!(
+            self,
+            "[{}] {old} moved to {from} (address changed, socket {:#x})",
+            leg.sid,
+            leg.socket_id
+        );
+        if let Some(other) = self.legs.get_mut(&leg.peer) {
+            other.peer = from;
+        }
+        if let Some(addrs) = self.by_dest.get_mut(&dest) {
+            for a in addrs.iter_mut().filter(|a| **a == old) {
+                *a = from;
+            }
+        }
+        self.legs.insert(from, leg);
+        true
+    }
+
+    /// Adds or removes a leg in `by_dest`.
+    fn index_leg(&mut self, addr: SocketAddr, dest: u32, add: bool) {
+        let addrs = self.by_dest.entry(dest).or_default();
+        if add {
+            addrs.push(addr);
+        } else {
+            addrs.retain(|a| *a != addr);
+            if addrs.is_empty() {
+                self.by_dest.remove(&dest);
+            }
         }
     }
 
@@ -743,7 +838,8 @@ impl Relay {
         };
         let latency = lat(&a).max(lat(&b));
         let encrypted = a_km.is_some();
-        log!(self, "[{sid}] PAIR {} (socket {:#x}, isn {}) <-> {} (socket {:#x}, isn {}), latency {} ms (asked {} / {}), {}",
+        let mss = a.hs.mss.min(b.hs.mss).min(self.max_mss.unwrap_or(u32::MAX));
+        log!(self, "[{sid}] PAIR {} (socket {:#x}, isn {}) <-> {} (socket {:#x}, isn {}), latency {} ms (asked {} / {}), mss {mss}, {}",
             a.addr, a.hs.socket_id, a.hs.isn, b.addr, b.hs.socket_id, b.hs.isn, latency, lat(&a), lat(&b),
             match a_km.and_then(km_params) {
                 Some((c, k)) => format!("{} AES-{}", if c == 4 { "GCM" } else { "CTR" }, k * 8),
@@ -762,7 +858,7 @@ impl Relay {
         // Response and KM injection for each side, in an order that lets
         // each side hold the peer's key before the peer can send data.
         for (x, p, isn, x_is_a) in [(&a, &b, isn_a, true), (&b, &a, isn_b, false)] {
-            let mut rsp = response_for(x, p, latency);
+            let mut rsp = response_for(x, p, latency, self.max_mss);
             rsp.isn = isn;
             let rsp_pkt = handshake_packet(&rsp, p.ts_now(), x.hs.socket_id);
             self.send(x.addr, &rsp_pkt);
@@ -777,12 +873,15 @@ impl Relay {
                     required: direction.is_some(),
                 }
             });
+            self.index_leg(x.addr, p.hs.socket_id, true);
             self.legs.insert(
                 x.addr,
                 Leg {
                     sid: sid.clone(),
                     peer: p.addr,
                     socket_id: x.hs.socket_id,
+                    peer_socket_id: p.hs.socket_id,
+                    refused_from: None,
                     encrypted,
                     response: rsp_pkt,
                     injected_km: km.map(<[u8]>::to_vec),
@@ -810,8 +909,10 @@ impl Relay {
         let Some(leg) = self.legs.remove(&addr) else {
             return;
         };
+        self.index_leg(addr, leg.peer_socket_id, false);
         self.print_stats(addr, &leg);
         if let Some(other) = self.legs.remove(&leg.peer) {
+            self.index_leg(leg.peer, other.peer_socket_id, false);
             self.print_stats(leg.peer, &other);
             let bye = control(CTRL_SHUTDOWN, 0, 0, 0, other.socket_id, &[0; 4]);
             self.send(leg.peer, &bye);
@@ -890,8 +991,53 @@ impl Relay {
     }
 }
 
-/// The conclusion response for `x`, describing its peer `p`.
-fn response_for(x: &Party, p: &Party, latency: u32) -> Handshake {
+/// Whether a packet from `from`, an unknown address, may take over the
+/// established leg at `old` (last heard from at `last_rx`) whose session its
+/// destination socket id names. Socket ids are the callers' own random
+/// 32-bit values, so an off-path sender has to guess one; on top of that:
+/// - only a plausible SRT packet: data, or a known control type other than
+///   a handshake (a handshake from a new address is a new caller);
+/// - the same IP family as before;
+/// - the old address has been silent for `REBIND_QUIET`, so a leg in use
+///   cannot be taken over, and late packets from the old address cannot
+///   take it back.
+fn rebind_allowed(
+    old: SocketAddr,
+    last_rx: Instant,
+    from: SocketAddr,
+    p: &[u8],
+    now: Instant,
+) -> Result<(), &'static str> {
+    if p.len() < HDR {
+        return Err("too short");
+    }
+    if is_control(p) && !matches!(ctrl_type(p), 1..=8 | CTRL_EXT) {
+        return Err("not a session packet");
+    }
+    if old.is_ipv4() != from.is_ipv4() {
+        return Err("other IP family");
+    }
+    if now.saturating_duration_since(last_rx) < REBIND_QUIET {
+        return Err("the current address is still active");
+    }
+    Ok(())
+}
+
+/// `--max-mss`: a number in `MSS_RANGE`.
+fn parse_max_mss(s: &str) -> Result<u32, String> {
+    match s.trim().parse::<u32>() {
+        Ok(n) if MSS_RANGE.contains(&n) => Ok(n),
+        _ => Err(format!(
+            "max MSS must be a number from {} to {}, got {s:?}",
+            MSS_RANGE.start(),
+            MSS_RANGE.end()
+        )),
+    }
+}
+
+/// The conclusion response for `x`, describing its peer `p`. The MSS is the
+/// smaller of the two callers', capped at `max_mss`.
+fn response_for(x: &Party, p: &Party, latency: u32, max_mss: Option<u32>) -> Handshake {
     let (p_ver, p_flags, _) = p.hs.hsreq().unwrap();
     let mut hsrsp = Vec::with_capacity(12);
     hsrsp.extend(p_ver.to_be_bytes());
@@ -915,7 +1061,7 @@ fn response_for(x: &Party, p: &Party, latency: u32) -> Handshake {
         enc_field: 0,
         ext_field,
         isn: p.hs.isn,
-        mss: x.hs.mss.min(p.hs.mss),
+        mss: x.hs.mss.min(p.hs.mss).min(max_mss.unwrap_or(u32::MAX)),
         flow: p.hs.flow,
         hs_type: HS_CONCLUSION,
         socket_id: p.hs.socket_id,
@@ -958,6 +1104,7 @@ fn main() {
         }
     }
     let mut health_listen = env("SRT_SPLICE_HEALTH").unwrap_or_else(|| "127.0.0.1:9001".into());
+    let mut max_mss = env("SRT_SPLICE_MAX_MSS");
     let mut verbose = false;
     let mut fingerprint = true;
     let mut args = std::env::args().skip(1);
@@ -967,29 +1114,30 @@ fn main() {
             "--no-fingerprint" => fingerprint = false,
             "-l" | "--listen" => listen = args.next().expect("--listen ADDR"),
             "--health" => health_listen = args.next().expect("--health ADDR|off"),
+            "--max-mss" => max_mss = Some(args.next().expect("--max-mss N")),
             "--api" | "--public" => removed(&a),
             _ => {
                 eprintln!(
                     "usage: srt-splice [--listen ADDR:PORT] [--health ADDR:PORT|off] \
-                     [--no-fingerprint] [-v]"
+                     [--max-mss N] [--no-fingerprint] [-v]"
                 );
                 std::process::exit(2);
             }
         }
     }
+    let max_mss = max_mss.map(|s| {
+        parse_max_mss(&s).unwrap_or_else(|e| {
+            eprintln!("srt-splice: {e}");
+            std::process::exit(2);
+        })
+    });
     let sock = UdpSocket::bind(&listen).expect("bind");
     sock.set_read_timeout(Some(TICK)).unwrap();
-    let mut r = Relay {
-        sock,
-        verbose,
-        fingerprint,
-        t0: Instant::now(),
-        secret: RandomState::new(),
-        pending: HashMap::new(),
-        replaced: HashMap::new(),
-        legs: HashMap::new(),
-    };
+    let mut r = Relay::new(sock, verbose, fingerprint, max_mss);
     log!(r, "srt-splice listening on udp {listen}");
+    if let Some(m) = max_mss {
+        log!(r, "MSS capped at {m}");
+    }
     if health_listen != "off" {
         match health::spawn(&health_listen) {
             Ok(addr) => log!(r, "health on http://{addr}/healthz"),
@@ -1457,6 +1605,149 @@ mod tests {
         ));
         let reconnect = enc(party(3, Mode::Request, ms(500), ms(500)), 2, 16);
         assert_eq!(admit(&waiting, &reconnect, ms(500)), Admit::Replace(0));
+    }
+
+    /// A relay on loopback with a paired session between two real sockets
+    /// (socket ids 0x111 and 0x222), their conclusion responses drained.
+    fn session() -> (Relay, UdpSocket, UdpSocket) {
+        let sock = |_| {
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            s
+        };
+        let (ca, cb) = (sock(0), sock(1));
+        let mut r = Relay::new(sock(2), false, true, None);
+        let t = Instant::now();
+        let mut a = libsrt(party(1, Mode::Publish, t, t), 0x0001_0506);
+        let mut b = libsrt(party(2, Mode::Unknown, t, t), 0x0001_0506);
+        a.addr = ca.local_addr().unwrap();
+        b.addr = cb.local_addr().unwrap();
+        a.hs.socket_id = 0x111;
+        b.hs.socket_id = 0x222;
+        r.pair(a, b);
+        let mut buf = [0u8; 2048];
+        ca.recv(&mut buf).unwrap();
+        cb.recv(&mut buf).unwrap();
+        (r, ca, cb)
+    }
+
+    /// A data packet to socket `dest` with sequence number `seq`.
+    fn data_to(dest: u32, seq: u32) -> Vec<u8> {
+        let mut p = vec![0u8; HDR + 8];
+        p[..4].copy_from_slice(&seq.to_be_bytes());
+        p[12..16].copy_from_slice(&dest.to_be_bytes());
+        p
+    }
+
+    /// The sequence number of the next packet `s` receives, if any.
+    fn recv_seq(s: &UdpSocket) -> Option<u32> {
+        let mut buf = [0u8; 2048];
+        let n = s.recv(&mut buf).ok()?;
+        Some(data_seq(&buf[..n]))
+    }
+
+    /// Makes the leg at `addr` look silent since `ago`.
+    fn silent_for(r: &mut Relay, addr: SocketAddr, ago: Duration) {
+        r.legs.get_mut(&addr).unwrap().last_rx = Instant::now() - ago;
+    }
+
+    #[test]
+    fn rebind_moves_the_leg_and_both_directions_keep_working() {
+        let (mut r, ca, cb) = session();
+        let (a, b) = (ca.local_addr().unwrap(), cb.local_addr().unwrap());
+        r.on_packet(a, &data_to(0x222, 1));
+        assert_eq!(recv_seq(&cb), Some(1));
+        // A's NAT mapping changes: the same caller, a new port.
+        let ca2 = UdpSocket::bind("127.0.0.1:0").unwrap();
+        ca2.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let a2 = ca2.local_addr().unwrap();
+        // While the old address is in use, the leg stays where it is.
+        r.on_packet(a2, &data_to(0x222, 2));
+        assert!(r.legs.contains_key(&a) && !r.legs.contains_key(&a2));
+        silent_for(&mut r, a, REBIND_QUIET * 2);
+        r.on_packet(a2, &data_to(0x222, 3));
+        assert_eq!(recv_seq(&cb), Some(3));
+        assert!(r.legs.contains_key(&a2) && !r.legs.contains_key(&a));
+        assert_eq!(r.legs[&b].peer, a2);
+        assert_eq!(r.legs[&a2].peer, b);
+        assert_eq!(r.by_dest[&0x222], vec![a2]);
+        // B to A goes to the new address.
+        r.on_packet(b, &data_to(0x111, 7));
+        assert_eq!(recv_seq(&ca2), Some(7));
+        // A late packet from the old address cannot take it back.
+        r.on_packet(a, &data_to(0x222, 4));
+        assert!(r.legs.contains_key(&a2) && !r.legs.contains_key(&a));
+        // Teardown cleans the index.
+        r.teardown(a2, "test");
+        assert!(r.legs.is_empty() && r.by_dest.is_empty());
+    }
+
+    #[test]
+    fn rebind_needs_one_unambiguous_dest_id_and_a_session_packet() {
+        let (mut r, ca, cb) = session();
+        let a = ca.local_addr().unwrap();
+        silent_for(&mut r, a, Duration::from_secs(1));
+        let x: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        // Unknown destination id: a stray.
+        r.on_packet(x, &data_to(0x333, 1));
+        assert!(!r.legs.contains_key(&x));
+        // A handshake from a new address is a new caller, never a rebind.
+        let hs = control(CTRL_HANDSHAKE, 0, 0, 0, 0x222, &[0; HS_CIF]);
+        r.on_packet(x, &hs);
+        assert!(!r.legs.contains_key(&x) && r.legs.contains_key(&a));
+        // Nor an unknown control type, or another IP family.
+        let t = Instant::now();
+        let odd = control(0x0042, 0, 0, 0, 0x222, &[]);
+        assert!(rebind_allowed(a, t - Duration::from_secs(1), x, &odd, t).is_err());
+        let v6: SocketAddr = "[::1]:5000".parse().unwrap();
+        let p = data_to(0x222, 1);
+        assert!(rebind_allowed(a, t - Duration::from_secs(1), v6, &p, t).is_err());
+        assert!(rebind_allowed(a, t - Duration::from_secs(1), x, &p, t).is_ok());
+        let ack = control(2, 0, 0, 0, 0x222, &[0; 4]);
+        assert!(rebind_allowed(a, t - Duration::from_secs(1), x, &ack, t).is_ok());
+        // Ambiguous ids (two legs expect the same one) never rebind.
+        r.by_dest
+            .get_mut(&0x222)
+            .unwrap()
+            .push(cb.local_addr().unwrap());
+        r.on_packet(x, &data_to(0x222, 1));
+        assert!(!r.legs.contains_key(&x));
+    }
+
+    #[test]
+    fn still_sending_leg_is_not_taken() {
+        let (mut r, ca, cb) = session();
+        let (a, b) = (ca.local_addr().unwrap(), cb.local_addr().unwrap());
+        let x: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        // Heard from 400 ms ago (a low-bitrate sender between packets): kept.
+        silent_for(&mut r, a, Duration::from_millis(400));
+        r.on_packet(x, &data_to(0x222, 1));
+        assert!(r.legs.contains_key(&a) && !r.legs.contains_key(&x));
+        assert_eq!(r.legs[&b].peer, a);
+        let t = Instant::now();
+        let p = data_to(0x222, 1);
+        assert!(rebind_allowed(a, t - REBIND_QUIET + Duration::from_millis(1), x, &p, t).is_err());
+        assert!(rebind_allowed(a, t - REBIND_QUIET, x, &p, t).is_ok());
+    }
+
+    #[test]
+    fn max_mss_caps_the_granted_mss() {
+        let t = Instant::now();
+        let mut a = libsrt(party(1, Mode::Publish, t, t), 0x0001_0506);
+        let b = libsrt(party(2, Mode::Unknown, t, t), 0x0001_0506);
+        assert_eq!(response_for(&a, &b, 120, None).mss, 1500);
+        assert_eq!(response_for(&a, &b, 120, Some(1400)).mss, 1400);
+        a.hs.mss = 1300;
+        assert_eq!(response_for(&a, &b, 120, None).mss, 1300);
+        assert_eq!(response_for(&b, &a, 120, Some(1400)).mss, 1300);
+        assert_eq!(parse_max_mss("1400"), Ok(1400));
+        assert_eq!(parse_max_mss("76"), Ok(76));
+        assert_eq!(parse_max_mss("1500"), Ok(1500));
+        for bad in ["75", "1501", "0", "-1", "x", ""] {
+            assert!(parse_max_mss(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

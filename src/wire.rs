@@ -65,6 +65,12 @@ pub fn timestamp(p: &[u8]) -> u32 {
     be32(p, 8)
 }
 
+/// The destination socket id: the receiving caller's own socket id (0 in
+/// an induction).
+pub fn dest_socket_id(p: &[u8]) -> u32 {
+    be32(p, 12)
+}
+
 /// Data packet: 31-bit sequence number.
 pub fn data_seq(p: &[u8]) -> u32 {
     be32(p, 0) & 0x7FFF_FFFF
