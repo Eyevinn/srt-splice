@@ -11,9 +11,10 @@
 //!
 //! Encryption: each caller generated its own key and expects its own KM
 //! echoed in the KMRSP, so the relay echoes it, and right after the
-//! handshake sends each side the other side's KM as an in-band KMREQ (a key
-//! update). The KM is wrapped with the passphrase, so the relay neither
-//! needs nor learns it.
+//! handshake sends the other side's KM as an in-band KMREQ (a key update):
+//! to the receiver if the direction is known, otherwise to both sides. The
+//! KM is wrapped with the passphrase, so the relay neither needs nor learns
+//! it.
 
 mod api;
 mod wire;
@@ -30,6 +31,13 @@ use wire::*;
 /// until answered or timed out. A waiting caller not heard from for this
 /// long has given up (one lost repeat is tolerated).
 const DEAD_AFTER: Duration = Duration::from_millis(400);
+/// Some callers send their conclusion once and wait for the answer without
+/// repeating it (gosrt). Such a caller, seen exactly once, counts as alive
+/// for this long after it arrived. It must be shorter than its connect
+/// timeout, so that a pairing still reaches it: 3 s by default in gosrt
+/// (measured from the induction) and libsrt. 2.5 s leaves 500 ms for the
+/// induction and the response on a slow path.
+const SINGLE_SHOT_ALIVE: Duration = Duration::from_millis(2500);
 const IDLE_TTL: Duration = Duration::from_secs(5);
 const TICK: Duration = Duration::from_millis(20);
 const KM_RETRY: Duration = Duration::from_millis(100);
@@ -79,6 +87,8 @@ struct Party {
     /// When this caller's first conclusion arrived.
     arrived: Instant,
     last_seen: Instant,
+    /// How often it has repeated its conclusion (0 = seen once).
+    repeats: u32,
 }
 
 impl Party {
@@ -86,8 +96,17 @@ impl Party {
         self.start.elapsed().as_micros() as u32
     }
 
+    /// Whether this caller is still waiting. A caller that repeats its
+    /// conclusion (libsrt, srt-protocol: every 250 ms) is gone once it falls
+    /// silent for `DEAD_AFTER`. One that has never repeated may be a caller
+    /// that sends its conclusion only once (gosrt): it counts as alive for
+    /// `SINGLE_SHOT_ALIVE` after it arrived.
     fn alive(&self, now: Instant) -> bool {
-        now - self.last_seen < DEAD_AFTER
+        if self.repeats == 0 {
+            now - self.arrived < SINGLE_SHOT_ALIVE
+        } else {
+            now - self.last_seen < DEAD_AFTER
+        }
     }
 
     /// Whether this caller sends from the ISN in the conclusion response
@@ -95,11 +114,22 @@ impl Party {
     /// rather than from its own (libsrt: sends from its own ISN, expects the
     /// peer from the response's). Against a real listener the two never
     /// differ, since the listener echoes the caller's ISN; here they do.
-    /// Fingerprint: srt-protocol 0.4 announces SRT 1.3.1 with exactly
-    /// TSBPDSND|TSBPDRCV|CRYPT|REXMITFLG; libsrt always adds TLPKTDROP and
-    /// NAKREPORT unless turned off.
+    /// Fingerprints, from the HSREQ (SRT version, flags):
+    /// - srt-protocol 0.4 announces SRT 1.3.1 with exactly
+    ///   TSBPDSND|TSBPDRCV|CRYPT|REXMITFLG (0x27); libsrt always adds
+    ///   TLPKTDROP and NAKREPORT unless turned off.
+    /// - gosrt (datarhei/gosrt, used by Restreamer and MediaMTX; checked in
+    ///   v0.13.0, `SRT_VERSION` in config.go and the HSREQ in dial.go)
+    ///   announces SRT 1.4.1 with TSBPDSND|TSBPDRCV|CRYPT|TLPKTDROP|
+    ///   NAKREPORT|REXMITFLG (0x3F). libsrt 1.4.0 and later always add
+    ///   FILTERCAP (0x80), so 1.4.1 with exactly 0x3F is not libsrt. It
+    ///   takes its ISN from the response (`cif.InitialPacketSequenceNumber`
+    ///   in dial.go), like srt-protocol.
     fn adopts_response_isn(&self) -> bool {
-        matches!(self.hs.hsreq(), Some((0x0001_0301, 0x27, _)))
+        matches!(
+            self.hs.hsreq(),
+            Some((0x0001_0301, 0x27, _)) | Some((0x0001_0401, 0x3F, _))
+        )
     }
 
     /// The SRT version this caller announces in its HSREQ (`0x00MMmmpp`).
@@ -137,6 +167,13 @@ fn sender(a: Mode, b: Mode) -> Result<Option<bool>, ()> {
     }
 }
 
+/// Whether side `a` (`x_is_a`) or `b` may receive data, given which side
+/// sends (`sender`): only the receiver when the direction is known, both
+/// when it is not.
+fn may_receive(a_sends: Option<bool>, x_is_a: bool) -> bool {
+    a_sends.is_none_or(|a_sends| a_sends != x_is_a)
+}
+
 /// Why two callers that met cannot be paired as they are.
 #[derive(Debug, PartialEq, Eq)]
 enum NoPair {
@@ -152,11 +189,17 @@ enum NoPair {
 ///
 /// With a known direction, both responses carry the sender's own ISN: the
 /// sender gets its ISN echoed, as from any listener, so it sends from it
-/// whether it is libsrt (own ISN) or srt-protocol (response ISN); every
-/// receiver expects the peer's data from the response ISN. No fingerprint.
-/// Except for a receiver that expects data from its own ISN (libsrt
-/// 1.5.0-1.5.2): it works only with a sender that sends from the response
-/// ISN, and then both get the receiver's ISN; otherwise it is refused.
+/// whether it is libsrt (own ISN) or one that adopts the response ISN;
+/// every receiver expects the peer's data from the response ISN.
+/// Except:
+/// - a sender recognised as adopting the response ISN (srt-protocol,
+///   gosrt; see `Party::adopts_response_isn`) gets the receiver's own ISN,
+///   like the receiver. It uses one ISN for both directions, so its ACKs
+///   then also match the receiver's own send sequence; with its own ISN,
+///   a libsrt receiver can take those ACKs for an attack and close.
+/// - a receiver that expects data from its own ISN (libsrt 1.5.0-1.5.2)
+///   works only with such a sender (both get its ISN); otherwise it is
+///   refused.
 ///
 /// Without one, fall back to recognising srt-protocol (`fingerprint`), or
 /// assume libsrt on both sides.
@@ -164,25 +207,25 @@ fn response_isns(a: &Party, b: &Party, fingerprint: bool) -> Result<(u32, u32, S
     if let Some(a_sends) = sender(a.mode, b.mode).map_err(|()| NoPair::SameRole)? {
         let (s, r) = if a_sends { (a, b) } else { (b, a) };
         let (who, rwho) = if a_sends { ("a", "b") } else { ("b", "a") };
-        if rcv_buffer_uses_own_isn(r) {
-            if !s.adopts_response_isn() {
-                return Err(NoPair::Receiver {
-                    a_receives: !a_sends,
-                    why: format!(
-                        "libsrt {} cannot receive through the relay (it expects data from its \
+        if rcv_buffer_uses_own_isn(r) && !s.adopts_response_isn() {
+            return Err(NoPair::Receiver {
+                a_receives: !a_sends,
+                why: format!(
+                    "libsrt {} cannot receive through the relay (it expects data from its \
                          own ISN); the receiver needs libsrt 1.5.3+ or 1.4.x",
-                        version_str(r.srt_version())
-                    ),
-                });
-            }
+                    version_str(r.srt_version())
+                ),
+            });
+        }
+        if s.adopts_response_isn() {
+            // Its ACKs (it acknowledges from the same ISN it sends from)
+            // must also fit the receiver's own send sequence, or libsrt
+            // drops the connection ("ATTACK/IPE: incoming ack seq ...
+            // exceeds current"): give both the receiver's own ISN.
             return Ok((
                 r.hs.isn,
                 r.hs.isn,
-                format!(
-                    "direction: {who} sends from the response ISN, {rwho} (libsrt {}) \
-                     expects its own: both get {rwho}'s ISN",
-                    version_str(r.srt_version())
-                ),
+                format!("direction: {who} sends from the response ISN: both get {rwho}'s ISN"),
             ));
         }
         return Ok((
@@ -206,7 +249,9 @@ fn response_isns(a: &Party, b: &Party, fingerprint: bool) -> Result<(u32, u32, S
         (true, true) => (a.hs.isn, a.hs.isn),
     };
     let how = if fingerprint {
-        format!("no direction, fingerprint: srt-protocol a={fa} b={fb}")
+        format!(
+            "no direction, fingerprint: takes the response ISN (srt-protocol, gosrt) a={fa} b={fb}"
+        )
     } else {
         "no direction, fingerprint off: assuming libsrt both".into()
     };
@@ -259,13 +304,21 @@ fn oldest_first<P: std::borrow::Borrow<Party>>(a: P, b: P) -> (P, P) {
 /// has repeated its conclusion since the newer one arrived. A caller that
 /// gave up, or a caller's own earlier attempt before it reconnected from a
 /// new port, never repeats, so it is never paired.
+///
+/// An older caller that has never repeated (one that sends its conclusion
+/// only once, like gosrt) cannot prove it that way; it counts as there
+/// while it is recent (see `Party::alive`). A caller that has repeated even
+/// once keeps the strict rule, so a dead libsrt attempt (repeats, then
+/// silence) is never paired.
 fn both_alive(a: &Party, b: &Party, now: Instant) -> bool {
     let (old, new) = oldest_first(a, b);
-    old.last_seen > new.arrived && new.alive(now) && old.alive(now)
+    let old_still_there = old.repeats == 0 || old.last_seen > new.arrived;
+    old_still_there && new.alive(now) && old.alive(now)
 }
 
-/// The best peer for `waiting[i]`, which has just repeated its conclusion:
-/// the compatible one, known to be alive, heard from most recently.
+/// The best peer for `waiting[i]`, which has just arrived or repeated its
+/// conclusion: the compatible one, known to be alive, heard from most
+/// recently.
 fn best_peer(waiting: &[Party], i: usize, now: Instant) -> Option<usize> {
     let x = &waiting[i];
     waiting
@@ -337,6 +390,11 @@ struct Inject {
     pkt: Vec<u8>,
     next: Instant,
     left: u32,
+    /// This side is known to receive, so it needs the key: no answer means
+    /// it cannot unwrap it (a wrong passphrase), and the session is torn
+    /// down. Without a known direction the relay cannot tell, and some
+    /// callers never answer an in-band key update (gosrt), so it only warns.
+    required: bool,
 }
 
 #[derive(Default)]
@@ -552,6 +610,7 @@ impl Relay {
             start: now.checked_sub(ts).unwrap_or(now),
             arrived: now,
             last_seen: now,
+            repeats: 0,
             hs,
         };
         if let Some(t) = self.replaced.get_mut(&from) {
@@ -567,16 +626,9 @@ impl Relay {
         if let Some(i) = waiting.iter().position(|c| c.addr == from) {
             // A repeat: refresh it, then pair with the best live peer.
             party.arrived = waiting[i].arrived;
+            party.repeats = waiting[i].repeats.saturating_add(1);
             waiting[i] = party;
-            if let Some(j) = best_peer(waiting, i, now) {
-                let (hi, lo) = (i.max(j), i.min(j));
-                let a = waiting.remove(hi);
-                let b = waiting.remove(lo);
-                if waiting.is_empty() {
-                    self.pending.remove(&sid);
-                }
-                self.pair(a, b);
-            }
+            self.try_pair(&sid, i, now);
             return;
         }
         match admit(waiting, &party, now) {
@@ -607,17 +659,37 @@ impl Relay {
             "waiting; no compatible peer yet".into()
         };
         self.log_waiting(&party, &what);
-        self.pending.get_mut(&sid).unwrap().push(party);
+        let waiting = self.pending.get_mut(&sid).unwrap();
+        waiting.push(party);
+        // An older caller that never repeats (gosrt) pairs right away.
+        let i = waiting.len() - 1;
+        self.try_pair(&sid, i, now);
+    }
+
+    /// Pairs `pending[sid][i]` with its best live peer, if there is one.
+    fn try_pair(&mut self, sid: &str, i: usize, now: Instant) {
+        let waiting = self.pending.get_mut(sid).unwrap();
+        if let Some(j) = best_peer(waiting, i, now) {
+            let (hi, lo) = (i.max(j), i.min(j));
+            let a = waiting.remove(hi);
+            let b = waiting.remove(lo);
+            if waiting.is_empty() {
+                self.pending.remove(sid);
+            }
+            self.pair(a, b);
+        }
     }
 
     fn log_waiting(&self, p: &Party, what: &str) {
         log!(
             self,
-            "[{}] {} {what} (socket {:#x}, {:?}, {})",
+            "[{}] {} {what} (socket {:#x}, {:?}, SRT {} flags {:#x}, {})",
             p.sid,
             p.addr,
             p.hs.socket_id,
             p.mode,
+            version_str(p.srt_version()),
+            p.hs.hsreq().map_or(0, |(_, f, _)| f),
             if p.hs.km().is_some() {
                 "encrypted"
             } else {
@@ -683,20 +755,26 @@ impl Relay {
             a.mode,
             b.mode
         );
+        // Which side needs the peer's key: only the receiver, if the
+        // direction is known (some callers do not take an in-band key update
+        // while they send, e.g. gosrt); both, if it is not.
+        let direction = sender(a.mode, b.mode).ok().flatten();
         // Response and KM injection for each side, in an order that lets
         // each side hold the peer's key before the peer can send data.
-        for (x, p, isn) in [(&a, &b, isn_a), (&b, &a, isn_b)] {
+        for (x, p, isn, x_is_a) in [(&a, &b, isn_a, true), (&b, &a, isn_b, false)] {
             let mut rsp = response_for(x, p, latency);
             rsp.isn = isn;
             let rsp_pkt = handshake_packet(&rsp, p.ts_now(), x.hs.socket_id);
             self.send(x.addr, &rsp_pkt);
-            let inject = p.hs.km().map(|km| {
+            let km = p.hs.km().filter(|_| may_receive(direction, x_is_a));
+            let inject = km.map(|km| {
                 let pkt = control(CTRL_EXT, CMD_KMREQ, 0, p.ts_now(), x.hs.socket_id, km);
                 self.send(x.addr, &pkt);
                 Inject {
                     pkt,
                     next: Instant::now() + KM_RETRY,
                     left: KM_TRIES,
+                    required: direction.is_some(),
                 }
             });
             self.legs.insert(
@@ -707,7 +785,7 @@ impl Relay {
                     socket_id: x.hs.socket_id,
                     encrypted,
                     response: rsp_pkt,
-                    injected_km: p.hs.km().map(<[u8]>::to_vec),
+                    injected_km: km.map(<[u8]>::to_vec),
                     inject,
                     last_rx: Instant::now(),
                     stats: Stats::default(),
@@ -755,11 +833,18 @@ impl Relay {
         // Injection retries.
         let mut sends = Vec::new();
         let mut gave_up = Vec::new();
+        let mut unsure = Vec::new();
         for (addr, leg) in self.legs.iter_mut() {
             if let Some(inj) = &mut leg.inject {
                 if now >= inj.next {
                     if inj.left == 0 {
-                        gave_up.push(*addr);
+                        if inj.required {
+                            gave_up.push(*addr);
+                        } else {
+                            // Stop retrying; a late KMRSP is still consumed.
+                            leg.inject = None;
+                            unsure.push((*addr, leg.sid.clone()));
+                        }
                     } else {
                         inj.left -= 1;
                         inj.next = now + KM_RETRY;
@@ -772,8 +857,19 @@ impl Relay {
             self.send(a, &p);
         }
         for a in gave_up {
-            log!(self, "{a}: no answer to the injected key");
+            log!(
+                self,
+                "{a}: no answer to the injected key (receiver): passphrase mismatch?"
+            );
             self.teardown(a, "key injection unanswered");
+        }
+        for (a, sid) in unsure {
+            log!(
+                self,
+                "[{sid}] WARNING: {a}: no answer to the injected key; if this side \
+                 receives, check the passphrase (state the direction to have the relay \
+                 detect it)"
+            );
         }
         self.replaced.retain(|_, t| now - *t < REPLACED_TTL);
         // Waiting callers that gave up.
@@ -964,6 +1060,7 @@ mod tests {
         assert_eq!(sender(Request, Request), Err(()));
     }
 
+    /// A caller; one heard from after it arrived has repeated its conclusion.
     fn party(port: u16, mode: Mode, arrived: Instant, last_seen: Instant) -> Party {
         Party {
             addr: SocketAddr::from(([127, 0, 0, 1], port)),
@@ -986,7 +1083,88 @@ mod tests {
             start: arrived,
             arrived,
             last_seen,
+            repeats: u32::from(last_seen > arrived),
         }
+    }
+
+    /// `p` after repeating its conclusion at `t`.
+    fn repeat(p: &mut Party, t: Instant) {
+        p.last_seen = t;
+        p.repeats += 1;
+    }
+
+    #[test]
+    fn single_shot_caller_counts_as_alive_while_recent() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        // gosrt: one conclusion, never repeated.
+        let once = party(1, Mode::Request, ms(0), ms(0));
+        assert!(once.alive(ms(400)) && once.alive(ms(2400)));
+        assert!(!once.alive(ms(2500)));
+        // It is the older one: pairs with a newer caller on its arrival.
+        let snd = party(2, Mode::Unknown, ms(2000), ms(2000));
+        assert!(both_alive(&once, &snd, ms(2000)));
+        assert!(!both_alive(&once, &snd, ms(2600)));
+        let mut waiting = vec![once];
+        assert_eq!(admit(&waiting, &snd, ms(2000)), Admit::Wait);
+        waiting.push(snd);
+        assert_eq!(best_peer(&waiting, 1, ms(2000)), Some(0));
+        // Two single-shot callers pair on the second's arrival.
+        let a = party(3, Mode::Publish, ms(0), ms(0));
+        let b = party(4, Mode::Unknown, ms(1000), ms(1000));
+        assert!(both_alive(&a, &b, ms(1000)));
+    }
+
+    #[test]
+    fn repeating_caller_keeps_the_strict_rule() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        // A libsrt attempt that repeated, then fell silent: dead after 400 ms,
+        // and never paired with a caller that arrived after its last repeat.
+        let mut old = party(1, Mode::Unknown, ms(0), ms(0));
+        repeat(&mut old, ms(250));
+        assert!(old.alive(ms(600)) && !old.alive(ms(650)));
+        let new = party(2, Mode::Unknown, ms(300), ms(300));
+        assert!(!both_alive(&old, &new, ms(300)));
+        // It repeats after the newer one arrived: pair.
+        repeat(&mut old, ms(500));
+        assert!(both_alive(&old, &new, ms(500)));
+        // The newer one may be single-shot: alive while recent, not after
+        // the 400 ms a repeating caller gets.
+        repeat(&mut old, ms(1250));
+        assert_eq!(new.repeats, 0);
+        assert!(both_alive(&old, &new, ms(1250)));
+    }
+
+    #[test]
+    fn key_injected_only_into_the_receiver() {
+        use Mode::*;
+        let dir = |a, b| sender(a, b).unwrap();
+        // a sends: only b gets a's key.
+        assert!(!may_receive(dir(Publish, Unknown), true));
+        assert!(may_receive(dir(Publish, Unknown), false));
+        // b sends (a states m=request): only a.
+        assert!(may_receive(dir(Request, Unknown), true));
+        assert!(!may_receive(dir(Request, Unknown), false));
+        // No direction: both ways.
+        assert!(may_receive(dir(Unknown, Unknown), true));
+        assert!(may_receive(dir(Unknown, Unknown), false));
+    }
+
+    #[test]
+    fn gosrt_fingerprint() {
+        let t = Instant::now();
+        let p = |v, f| srt(party(1, Mode::Unknown, t, t), v, f).adopts_response_isn();
+        assert!(p(0x0001_0401, 0x3F), "gosrt");
+        assert!(p(0x0001_0301, 0x27), "srt-protocol");
+        // libsrt always adds FILTERCAP (0x80).
+        assert!(!p(0x0001_0401, 0xBF));
+        assert!(!p(0x0001_0400, 0xBF) && !p(0x0001_0402, 0xBF) && !p(0x0001_0506, 0xBF));
+        // gosrt sender, libsrt receiver, no direction: both get the receiver's ISN.
+        let go = srt(party(1, Mode::Unknown, t, t), 0x0001_0401, 0x3F);
+        let rcv = libsrt(party(2, Mode::Unknown, t, t), 0x0001_0506);
+        let (ia, ib, _) = response_isns(&go, &rcv, true).unwrap();
+        assert_eq!((ia, ib), (rcv.hs.isn, rcv.hs.isn));
     }
 
     #[test]
@@ -1099,6 +1277,24 @@ mod tests {
         let snd = libsrt(party(1, Mode::Publish, t, t), 0x0001_0501);
         let rcv = libsrt(party(2, Mode::Unknown, t, t), 0x0001_0506);
         let (ia, ib, _) = response_isns(&snd, &rcv, true).unwrap();
+        assert_eq!((ia, ib), (snd.hs.isn, snd.hs.isn));
+    }
+
+    #[test]
+    fn adopting_sender_with_direction_gets_the_receivers_isn() {
+        let t = Instant::now();
+        let rcv = libsrt(party(1, Mode::Request, t, t), 0x0001_0507);
+        for snd in [
+            srt(party(2, Mode::Unknown, t, t), 0x0001_0401, 0x3F),
+            srt_protocol(party(2, Mode::Unknown, t, t)),
+        ] {
+            let (ia, ib, _) = response_isns(&rcv, &snd, false).unwrap();
+            assert_eq!((ia, ib), (rcv.hs.isn, rcv.hs.isn));
+        }
+        // A libsrt sender gets its own ISN, whatever the receiver is.
+        let go_rcv = srt(party(1, Mode::Request, t, t), 0x0001_0401, 0x3F);
+        let snd = libsrt(party(2, Mode::Unknown, t, t), 0x0001_0507);
+        let (ia, ib, _) = response_isns(&go_rcv, &snd, true).unwrap();
         assert_eq!((ia, ib), (snd.hs.isn, snd.hs.isn));
     }
 
