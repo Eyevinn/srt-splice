@@ -21,10 +21,13 @@ UDP port, and Strom needs no listener port of its own. It does not depend
 on Strom.
 
 **Tested with:** libsrt 1.4 and 1.5 (`srt-live-transmit`, GStreamer
-`srtsrc`/`srtsink` in Strom, ffmpeg/ffplay, VLC 3.0.24) and the Rust
-`srt-protocol` crate. Other implementations (OBS, vMix, hardware encoders,
-gosrt, libsrt 1.3 and older) have not been tested yet. SRT implementations differ in how they read
-the handshake, so interop reports are welcome. See
+`srtsrc`/`srtsink` in Strom, ffmpeg/ffplay, VLC 3.0.24), the Rust
+`srt-protocol` crate and gosrt 0.13 (the Go SRT stack in Restreamer and
+MediaMTX). gosrt works as a sender, clear and encrypted, and as a receiver
+without encryption, but not as an encrypted receiver (see [Limits](#limits)).
+Other implementations (OBS, vMix, hardware encoders, libsrt 1.3 and older)
+have not been tested yet. SRT implementations differ in how they read the
+handshake, so interop reports are welcome. See
 [docs/TESTING.md](docs/TESTING.md).
 
 ## Quick start
@@ -58,17 +61,38 @@ To build from source: `cargo build --release` (std only, no dependencies).
 - **The waiting caller sits in the handshake** until its peer arrives. Its
   connect timeout (3 s by default in libsrt) is how long it waits. Callers
   that reconnect automatically (OBS, vMix, Strom) just try again; otherwise
-  raise the timeout (`conntimeo` in libsrt URIs).
+  raise the timeout (`conntimeo` in libsrt URIs). gosrt sends its handshake
+  only once, so a gosrt caller that waits pairs only with a peer that
+  arrives within 2.5 s.
 - **Direction (recommended):** a caller may state its role with the SRT
   access-control syntax, `#!::r=<id>,m=publish` (I send) or
   `#!::r=<id>,m=request` (I receive). It pairs on `r`, so it pairs with a
-  plain `<id>` from the other side. With a direction, the sender sees the
-  same handshake answer a normal listener would give it, so the relay does
-  not depend on how a particular implementation reads it (see
+  plain `<id>` from the other side. With a direction, the relay knows which
+  side needs which sequence number and key, so it depends much less on how
+  a particular implementation reads the handshake, and it can detect a
+  wrong passphrase (see
   [docs/DESIGN.md](docs/DESIGN.md#isn-and-direction)). In a URI, encode it:
-  `streamid=%23!%3A%3Ar%3Dcam1%2Cm%3Drequest`.
+  `streamid=%23!%3A%3Ar%3Dcam1%2Cm%3Drequest`. Newer libsrt, GStreamer and
+  ffmpeg decode that. Older `srt-live-transmit` (tested: libsrt 1.4.2 and
+  1.5.1) does not: give it the raw form, quoted in the shell:
+  `"srt://relay:9000?streamid=#!::r=cam1,m=request"`.
 
 How this works in detail: [docs/DESIGN.md](docs/DESIGN.md).
+
+### Streamid
+
+- **Every caller must be able to set a streamid**: it is the pairing key.
+  libsrt supports it since 1.3.0 (2018), and so do the common tools:
+  `streamid=` in ffmpeg and OBS URLs, GStreamer `srtsrc`/`srtsink`, VLC
+  3.0.24, and a Stream ID field in vMix and Larix. Some older or low-end
+  hardware encoders have no streamid field and cannot use the relay.
+- **Length:** the protocol allows 512 characters, but some devices cap the
+  field (at 32 or 64, for example). The 22-character ids that Strom and
+  Open Live generate fit.
+- **Characters:** the outside party only needs the plain id. Use URL-safe
+  characters (`[A-Za-z0-9_-]`). Some devices reject `#`, `!`, `:` or `,`,
+  and some tools do not URL-decode the streamid, so only the side that can
+  (Strom, for example) should use the `#!::r=…,m=…` form.
 
 ## Configuration
 
@@ -124,6 +148,11 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 - libsrt 1.5.0–1.5.2 can send through the relay but not receive; a receiver
   on those versions needs 1.5.3+ or 1.4.x
   ([why](docs/DESIGN.md#libsrt-150-to-152-as-receiver)).
+- gosrt cannot receive encrypted streams through the relay: it does not
+  take the sender's key as an in-band key update
+  ([why](docs/DESIGN.md#gosrt)). Clear streams, and gosrt as a sender, work.
+- A wrong passphrase is detected (and the session closed) only when the
+  direction is stated; without it the relay just logs a warning.
 
 What has been tested, and how: [docs/TESTING.md](docs/TESTING.md).
 

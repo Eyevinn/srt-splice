@@ -27,11 +27,13 @@ other caller's parameters, which is described below.
 1. **Induction.** The relay answers by itself: HSv5, the SRT magic, and a
    cookie keyed with a per-process random secret.
 2. **Conclusion.** The relay reads the streamid (the SID extension) and
-   *holds* the conclusion without answering. The caller repeats it every
-   250 ms until its connect timeout.
+   *holds* the conclusion without answering. libsrt and srt-protocol repeat
+   it every 250 ms until their connect timeout; gosrt sends it once and
+   waits (see [Pairing rules](#pairing-rules)).
    - A conclusion whose cookie does not match its source address is dropped,
      so a spoofed source cannot hold a streamid or make the relay send to it.
-   - A waiting caller not heard from for 400 ms is treated as gone.
+   - A waiting caller that repeats and is then not heard from for 400 ms is
+     treated as gone. One that has never repeated is kept for 2.5 s.
 3. **Pairing.** When a second caller with the same streamid is waiting, the
    relay answers both conclusions. Each side gets the **other side's**
    values:
@@ -56,6 +58,15 @@ other caller's parameters, which is described below.
   its conclusion after the newer one arrived (at most about 250 ms later).
   This proves both are still there. A caller that gave up, or a caller's own
   earlier attempt before it reconnected from a new port, is never paired.
+- **Callers that do not repeat:** gosrt sends its conclusion once and waits
+  for the answer. A caller seen exactly once counts as alive for 2.5 s
+  after it arrived, and is paired as soon as a compatible peer arrives in
+  that time (or repeats). 2.5 s is below the 3 s default connect timeout of
+  gosrt (counted from its induction) and libsrt, so the answer still finds
+  it waiting. A caller that has repeated even once keeps the strict rule
+  above, so a dead libsrt attempt (repeats, then silence) is never paired.
+  A libsrt attempt that dies within its first 250 ms looks like a gosrt
+  caller for those 2.5 s; that is the price.
 - **Roles:** two callers that state the same role (`m=publish` or
   `m=request`) are never paired.
   - From the same host, the newer one is that caller reconnecting (callers
@@ -82,14 +93,28 @@ other caller's parameters, which is described below.
 
 A libsrt caller only accepts its *own* key material back in the KMRSP, so
 the relay echoes it. Each caller has generated its own key, so right after
-the handshake the relay sends each side the *other* side's KM as an in-band
-key update (`UMSG_EXT` / `KMREQ`).
+the handshake the relay sends the *other* side's KM as an in-band key
+update (`UMSG_EXT` / `KMREQ`):
+- **direction known:** only to the receiver. The sender does not need the
+  peer's key, and some implementations do not take a key update while they
+  send (gosrt).
+- **no direction:** to both sides, since either may receive.
 
 The KM is wrapped with a key derived from the passphrase and a salt, and the
 salt travels in the KM. So the receiver unwraps it with its own passphrase;
-the relay neither needs nor learns it. The relay repeats the update until a
-KMRSP arrives, and consumes that KMRSP. After that, key refreshes from the
-sender go end to end like everything else.
+the relay neither needs nor learns it. The relay repeats the update every
+100 ms until a KMRSP arrives (for 3 s), and consumes that KMRSP. After
+that, key refreshes from the sender go end to end like everything else.
+
+**A wrong passphrase.** libsrt does not answer a key update it cannot
+unwrap. So:
+- **direction known:** no answer from the receiver within 3 s means it
+  cannot decrypt, and the relay tears the session down.
+- **no direction:** the relay cannot tell whether that side needs the key
+  (a gosrt sender never answers either), so it stops retrying and logs a
+  warning; the session stays up.
+- An explicit error answer (a KMRSP with only a KM state) tears the session
+  down either way: the passphrases differ, so neither side can decrypt.
 
 ## ISN and direction
 
@@ -106,6 +131,15 @@ sender sees exactly what any listener would send it (its own ISN echoed),
 and every receiver expects the peer's data from the response's ISN, whatever
 the implementation.
 
+One exception: a sender recognised as taking its ISN from the response
+(srt-protocol or gosrt, by the fingerprint below) gets the *receiver's* own
+ISN, and so does the receiver. Such a sender uses one ISN for both
+directions, also in the ACKs it sends back. With its own ISN those ACKs do
+not fit the receiver's own send sequence, and libsrt can close the
+connection ("ATTACK/IPE: incoming ack seq ... exceeds current"), depending
+on which of the two random ISNs is larger. With the receiver's ISN
+everything lines up, as in the no-direction case.
+
 The direction comes from the streamid in the SRT access-control syntax:
 - `#!::r=<id>,m=publish` means this caller sends.
 - `#!::r=<id>,m=request` means this caller receives.
@@ -114,10 +148,30 @@ It pairs on `r`, so either side can state it and the other can use a plain
 `<id>`. Strom always states it.
 
 Without a direction (plain streamids on both sides, or `m=bidirectional`),
-the relay falls back to recognising srt-protocol by its HSREQ (SRT 1.3.1,
-flags exactly `0x27`), and otherwise assumes libsrt. That fingerprint is
-fragile, so give the direction where you can. `--no-fingerprint` turns the
-fallback off.
+the relay falls back to recognising the implementations that take their ISN
+from the response by their HSREQ, and otherwise assumes libsrt:
+- srt-protocol 0.4: SRT 1.3.1, flags exactly `0x27`;
+- gosrt 0.13: SRT 1.4.1, flags exactly `0x3F`. libsrt 1.4.0 and later
+  always set FILTERCAP (`0x80`), so libsrt never sends this.
+
+That fingerprint is fragile (a new gosrt release may announce another
+version), so give the direction where you can. `--no-fingerprint` turns
+the fallback off.
+
+### gosrt
+
+gosrt (github.com/datarhei/gosrt, the SRT stack of Restreamer and MediaMTX)
+differs from libsrt in three ways that matter here, checked in v0.13.0:
+- It takes its ISN from the conclusion response, for both directions, like
+  srt-protocol (see above).
+- It sends its conclusion once and does not repeat it (see
+  [Pairing rules](#pairing-rules)).
+- It refuses an in-band key update for the key slot it already uses
+  ("wants to reset the key that is already in use"), and does not answer.
+  Both callers start on the even key, so gosrt never takes the sender's key
+  the relay injects. As a sender that does not matter (it gets no
+  injection when the direction is known); as an encrypted receiver it
+  cannot decrypt. The relay cannot fix that without the passphrase.
 
 ### libsrt 1.5.0 to 1.5.2 as receiver
 
@@ -132,7 +186,7 @@ of the AES-CTR/GCM IV.
 
 The relay reads the version from the HSREQ:
 - **Direction known, affected receiver:** if the sender adopts the response
-  ISN (srt-protocol), both responses carry the *receiver's* ISN, and it
+  ISN (srt-protocol, gosrt), both responses carry the *receiver's* ISN, and it
   works. Otherwise the receiver is refused with `SRT_REJX_UNACCEPTABLE`
   (1406) and a log line naming its version. The sender keeps waiting.
 - **No direction:** never refused, since an affected caller that only sends
@@ -151,8 +205,8 @@ per session with `-v`.
   early, would mean rewriting socket ids and sequence numbers later. That
   breaks the AES counter (CTR uses the sequence number) and the GCM tag.
 - **A wrong passphrase gives no KMRSP from libsrt** for an in-band KMREQ it
-  cannot unwrap. The relay only notices by timeout (3 s) and then tears the
-  session down.
+  cannot unwrap. The relay only notices by timeout (3 s), and only when the
+  direction is known (see [Encryption](#encryption)).
 - **colima / Docker on macOS:** the UDP port forward to `localhost` can stop
   working when the container is recreated. Use the VM's address instead.
 
