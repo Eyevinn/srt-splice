@@ -33,8 +33,7 @@ handshake, so interop reports are welcome. See
 ## Quick start
 
 ```sh
-docker run --rm -p 9000:9000/udp -e SRT_SPLICE_PUBLIC=relay.example.com:9000 \
-  ghcr.io/eyevinn/srt-splice:latest
+docker run --rm -p 9000:9000/udp ghcr.io/eyevinn/srt-splice:latest
 ```
 
 Then connect a receiver and a sender, in either order, with the same
@@ -99,16 +98,16 @@ How this works in detail: [docs/DESIGN.md](docs/DESIGN.md).
 | Option (env) | Default | |
 |---|---|---|
 | `--listen`, `-l` (`SRT_SPLICE_LISTEN`) | `0.0.0.0:9000` | The SRT UDP port, the one exposed publicly. |
-| `--public` (`SRT_SPLICE_PUBLIC`) | unset | The address the outside world dials. Reported by the API. |
-| `--api` (`SRT_SPLICE_API`) | `127.0.0.1:9001` (image: `0.0.0.0:9001`) | Read-only HTTP API, `off` to disable. Internal network only. |
+| `--health` (`SRT_SPLICE_HEALTH`) | `127.0.0.1:9001` (image: `0.0.0.0:9001`) | HTTP health endpoint for probes, `off` to disable. Internal network only. |
 | `--no-fingerprint` | off | Without a stated direction, do not guess the caller's SRT implementation. |
 | `-v` | off | Log per-session stats every 5 s. |
 
 A command-line option wins over its environment variable.
 
-The HTTP API is for services next to the relay:
-- `GET /v1/info` returns `{"version":"0.1.1","public":"relay.example.com:9000","srt_port":9000}`.
-- `GET /healthz` returns `ok`.
+The health endpoint serves only `GET /healthz`, which returns `ok`. Nothing
+needs the relay's HTTP port to use it: clients are configured with the
+relay's public address directly. `--api`, `--public` and their environment
+variables were removed in 0.2.0; the relay refuses to start if they are set.
 
 Running it in Kubernetes, Docker and behind NAT: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
@@ -116,8 +115,12 @@ Running it in Kubernetes, Docker and behind NAT: [docs/DEPLOYMENT.md](docs/DEPLO
 
 Strom dials the relay itself when an SRT block's `srt_uri` is
 `srt+relay://<id>?passphrase=…` and Strom is started with
-`STROM_SRT_RELAY=<relay host>:9000`. Strom reads the public address from the
-relay's API and shows the outside party where to connect. The GUI has a
+`STROM_SRT_RELAY=<public host>:9000`, the relay's public address. Strom dials
+it and shows it to the outside party as the place to connect. When Strom runs
+next to the relay (same cluster or network), also set
+`STROM_SRT_RELAY_INTERNAL=<internal host>:9000`: Strom then dials that
+address instead, and still shows the public one. This avoids hairpin NAT
+through the load balancer. The GUI has a
 "Publish via SRT relay" button that generates the id and the passphrase.
 This is added in [Eyevinn/strom#1258](https://github.com/Eyevinn/strom/pull/1258).
 
@@ -132,7 +135,7 @@ This is added in [Eyevinn/strom#1258](https://github.com/Eyevinn/strom/pull/1258
 - The relay sees what SRT carries in clear text: sequence numbers, packet
   and byte counts, and the streamid.
 - There is no authentication, access policy or rate limit in the relay.
-  Keep the HTTP API off the public network.
+  Keep the health port off the public network.
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 

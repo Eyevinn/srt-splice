@@ -1,9 +1,6 @@
-//! A tiny read-only HTTP API, for the services that use the relay (e.g.
-//! Strom asks it for the public address to hand out). Meant for the
-//! internal network only: never expose it publicly.
-//!
-//! - `GET /v1/info`  -> `{"version":"…","public":"host:port"|null,"srt_port":9000}`
-//! - `GET /healthz`  -> `ok`
+//! A tiny HTTP health endpoint for orchestrators (readiness/liveness
+//! probes): `GET /healthz` -> `ok`. Nothing else is served. Meant for the
+//! internal network only.
 //!
 //! Each connection gets its own short-lived thread and at most `DEADLINE`
 //! in total, so a slow or idle client cannot hold up a health probe.
@@ -23,20 +20,14 @@ const MAX_HEAD: usize = 8192;
 /// Pause after a failed accept (e.g. out of file descriptors).
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
-pub struct Info {
-    pub public: Option<String>,
-    pub srt_port: u16,
-}
-
-/// Binds `listen` and serves the API on background threads. Returns the
-/// bound address.
-pub fn spawn(listen: &str, info: Info) -> std::io::Result<SocketAddr> {
+/// Binds `listen` and serves the health endpoint on background threads.
+/// Returns the bound address.
+pub fn spawn(listen: &str) -> std::io::Result<SocketAddr> {
     let listener = TcpListener::bind(listen)?;
     let addr = listener.local_addr()?;
-    let info = Arc::new(info);
     std::thread::Builder::new()
-        .name("api".into())
-        .spawn(move || serve(listener, info))?;
+        .name("health".into())
+        .spawn(move || serve(listener))?;
     Ok(addr)
 }
 
@@ -50,7 +41,7 @@ impl Drop for Slot {
     }
 }
 
-fn serve(listener: TcpListener, info: Arc<Info>) {
+fn serve(listener: TcpListener) {
     let active = Arc::new(AtomicUsize::new(0));
     let mut failing = false;
     loop {
@@ -61,7 +52,7 @@ fn serve(listener: TcpListener, info: Arc<Info>) {
             }
             Err(e) => {
                 if !failing {
-                    eprintln!("api: accept: {e}");
+                    eprintln!("health: accept: {e}");
                     failing = true;
                 }
                 std::thread::sleep(ACCEPT_BACKOFF);
@@ -73,28 +64,27 @@ fn serve(listener: TcpListener, info: Arc<Info>) {
             continue; // dropped: closed
         }
         let slot = Slot(active.clone());
-        let info = info.clone();
         // If the thread cannot start, the closure (and with it the slot and
         // the stream) is dropped.
         let _ = std::thread::Builder::new()
-            .name("api-conn".into())
+            .name("health-conn".into())
             .spawn(move || {
                 let _slot = slot;
-                let _ = handle(stream, &info);
+                let _ = handle(stream);
             });
     }
 }
 
-fn handle(mut stream: TcpStream, info: &Info) -> std::io::Result<()> {
+fn handle(mut stream: TcpStream) -> std::io::Result<()> {
     let deadline = Instant::now() + DEADLINE;
-    let (status, ctype, body) = match read_head(&mut stream, deadline)? {
-        Some(head) => route(&head, info),
+    let (status, body) = match read_head(&mut stream, deadline)? {
+        Some(head) => route(&head),
         None => bad_request(),
     };
     stream.set_write_timeout(Some(remaining(deadline)?))?;
     write!(
         stream,
-        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )?;
     stream.flush()
@@ -144,14 +134,14 @@ fn head_end(b: &[u8]) -> Option<usize> {
     })
 }
 
-type Response = (&'static str, &'static str, String);
+type Response = (&'static str, &'static str);
 
 fn bad_request() -> Response {
-    ("400 Bad Request", "text/plain", "bad request\n".into())
+    ("400 Bad Request", "bad request\n")
 }
 
-/// The answer to a request head: (status, content type, body).
-fn route(head: &[u8], info: &Info) -> Response {
+/// The answer to a request head: (status, plain-text body).
+fn route(head: &[u8]) -> Response {
     let line = head.split(|&b| b == b'\n').next().unwrap_or_default();
     let Ok(line) = std::str::from_utf8(line) else {
         return bad_request();
@@ -167,74 +157,24 @@ fn route(head: &[u8], info: &Info) -> Response {
     }
     let path = target.split('?').next().unwrap_or_default();
     match (method, path) {
-        ("GET", "/v1/info") => ("200 OK", "application/json", info_json(info)),
-        ("GET", "/healthz") => ("200 OK", "text/plain", "ok\n".into()),
-        ("GET", _) => ("404 Not Found", "text/plain", "not found\n".into()),
-        _ => (
-            "405 Method Not Allowed",
-            "text/plain",
-            "method not allowed\n".into(),
-        ),
+        ("GET", "/healthz") => ("200 OK", "ok\n"),
+        ("GET", _) => ("404 Not Found", "not found\n"),
+        _ => ("405 Method Not Allowed", "method not allowed\n"),
     }
-}
-
-fn info_json(info: &Info) -> String {
-    let public = match &info.public {
-        Some(p) => format!("\"{}\"", json_escape(p)),
-        None => "null".into(),
-    };
-    format!(
-        "{{\"version\":\"{}\",\"public\":{public},\"srt_port\":{}}}\n",
-        env!("CARGO_PKG_VERSION"),
-        info.srt_port
-    )
-}
-
-fn json_escape(s: &str) -> String {
-    let mut o = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            c => o.push(c),
-        }
-    }
-    o
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn info() -> Info {
-        Info {
-            public: Some("srt.example.com:9000".into()),
-            srt_port: 9000,
-        }
-    }
-
-    #[test]
-    fn info_json_shape() {
-        let j = info_json(&info());
-        assert!(j.contains("\"public\":\"srt.example.com:9000\""));
-        assert!(j.contains("\"srt_port\":9000"));
-        let j = info_json(&Info {
-            public: None,
-            srt_port: 9000,
-        });
-        assert!(j.contains("\"public\":null"));
-        assert_eq!(json_escape("a\"b\\c\n"), "a\\\"b\\\\c\\u000a");
-    }
-
     #[test]
     fn routes() {
-        let status = |head: &[u8]| route(head, &info()).0;
+        let status = |head: &[u8]| route(head).0;
         assert_eq!(
             status(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n"),
             "200 OK"
         );
-        assert_eq!(status(b"GET /v1/info?x=1 HTTP/1.0\n\n"), "200 OK");
+        assert_eq!(status(b"GET /healthz?x=1 HTTP/1.0\n\n"), "200 OK");
         assert_eq!(status(b"GET /nope HTTP/1.1\r\n\r\n"), "404 Not Found");
         assert_eq!(
             status(b"POST /healthz HTTP/1.1\r\n\r\n"),
@@ -264,7 +204,7 @@ mod tests {
 
     #[test]
     fn idle_clients_do_not_block_healthz() {
-        let addr = spawn("127.0.0.1:0", info()).unwrap();
+        let addr = spawn("127.0.0.1:0").unwrap();
         // Idle connections and one that sends half a request.
         let idle: Vec<_> = (0..4).map(|_| TcpStream::connect(addr).unwrap()).collect();
         let mut half = TcpStream::connect(addr).unwrap();

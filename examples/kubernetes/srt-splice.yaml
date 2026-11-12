@@ -38,25 +38,21 @@ spec:
           env:
             - name: SRT_SPLICE_LISTEN
               value: 0.0.0.0:9000
-            # The read-only HTTP API (readiness probe, /v1/info). It must
-            # listen on the pod IP; keep it off the public Service.
-            - name: SRT_SPLICE_API
+            # The health endpoint for the readiness probe. It must listen on
+            # the pod IP; no Service exposes it.
+            - name: SRT_SPLICE_HEALTH
               value: 0.0.0.0:9001
-            # The address the outside world dials (your load balancer's DNS
-            # name or IP and port). Reported on GET /v1/info.
-            - name: SRT_SPLICE_PUBLIC
-              value: srt.example.com:9000
           ports:
             - name: srt
               containerPort: 9000
               protocol: UDP
-            - name: api
+            - name: health
               containerPort: 9001
               protocol: TCP
           readinessProbe:
             httpGet:
               path: /healthz
-              port: api
+              port: health
           resources:
             requests:
               cpu: 100m
@@ -88,10 +84,14 @@ spec:
       targetPort: srt
       protocol: UDP
 ---
-# Internal access for services in the cluster (e.g. Strom): the SRT port and
-# the read-only HTTP API. Never expose the API port publicly.
-# Strom: STROM_SRT_RELAY=srt-splice-internal:9000 (the API defaults to port 9001
-# on the same host).
+# Internal access to the SRT port for services in the same cluster, so they
+# do not have to hairpin through the load balancer.
+# Strom in this cluster:
+#   STROM_SRT_RELAY=<public host:port>   (the load balancer's address; Strom
+#                                         shows it to the outside party)
+#   STROM_SRT_RELAY_INTERNAL=srt-splice-internal:9000   (what Strom dials)
+# A relay elsewhere (e.g. a managed service) needs only
+#   STROM_SRT_RELAY=<public host:port>
 apiVersion: v1
 kind: Service
 metadata:
@@ -107,7 +107,3 @@ spec:
       port: 9000
       targetPort: srt
       protocol: UDP
-    - name: api
-      port: 9001
-      targetPort: api
-      protocol: TCP

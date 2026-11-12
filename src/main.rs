@@ -16,7 +16,7 @@
 //! KM is wrapped with the passphrase, so the relay neither needs nor learns
 //! it.
 
-mod api;
+mod health;
 mod wire;
 
 use std::collections::hash_map::RandomState;
@@ -943,8 +943,21 @@ fn peer_ip_field(a: SocketAddr) -> [u8; 16] {
 fn main() {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let mut listen = env("SRT_SPLICE_LISTEN").unwrap_or_else(|| "0.0.0.0:9000".into());
-    let mut api_listen = env("SRT_SPLICE_API").unwrap_or_else(|| "127.0.0.1:9001".into());
-    let mut public = env("SRT_SPLICE_PUBLIC");
+    // Removed in 0.2.0. Refuse them instead of silently ignoring them.
+    let removed = |old: &str| -> ! {
+        let hint = match old {
+            "--api" | "SRT_SPLICE_API" => "use --health / SRT_SPLICE_HEALTH",
+            _ => "configure clients with the relay's public address directly",
+        };
+        eprintln!("srt-splice: {old} was removed in 0.2.0: {hint}");
+        std::process::exit(2);
+    };
+    for old in ["SRT_SPLICE_API", "SRT_SPLICE_PUBLIC"] {
+        if env(old).is_some() {
+            removed(old);
+        }
+    }
+    let mut health_listen = env("SRT_SPLICE_HEALTH").unwrap_or_else(|| "127.0.0.1:9001".into());
     let mut verbose = false;
     let mut fingerprint = true;
     let mut args = std::env::args().skip(1);
@@ -953,19 +966,18 @@ fn main() {
             "-v" | "--verbose" => verbose = true,
             "--no-fingerprint" => fingerprint = false,
             "-l" | "--listen" => listen = args.next().expect("--listen ADDR"),
-            "--api" => api_listen = args.next().expect("--api ADDR|off"),
-            "--public" => public = Some(args.next().expect("--public HOST:PORT")),
+            "--health" => health_listen = args.next().expect("--health ADDR|off"),
+            "--api" | "--public" => removed(&a),
             _ => {
                 eprintln!(
-                    "usage: srt-splice [--listen ADDR:PORT] [--api ADDR:PORT|off] \
-                     [--public HOST:PORT] [--no-fingerprint] [-v]"
+                    "usage: srt-splice [--listen ADDR:PORT] [--health ADDR:PORT|off] \
+                     [--no-fingerprint] [-v]"
                 );
                 std::process::exit(2);
             }
         }
     }
     let sock = UdpSocket::bind(&listen).expect("bind");
-    let srt_port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
     sock.set_read_timeout(Some(TICK)).unwrap();
     let mut r = Relay {
         sock,
@@ -978,23 +990,13 @@ fn main() {
         legs: HashMap::new(),
     };
     log!(r, "srt-splice listening on udp {listen}");
-    if api_listen != "off" {
-        match api::spawn(
-            &api_listen,
-            api::Info {
-                public: public.clone(),
-                srt_port,
-            },
-        ) {
-            Ok(addr) => log!(
-                r,
-                "api on http://{addr} (public address: {})",
-                public.as_deref().unwrap_or("not set, use --public")
-            ),
-            // The API is a convenience: the relay runs on without it.
+    if health_listen != "off" {
+        match health::spawn(&health_listen) {
+            Ok(addr) => log!(r, "health on http://{addr}/healthz"),
+            // Only probes need it: the relay runs on without it.
             Err(e) => log!(
                 r,
-                "WARNING: api: cannot listen on {api_listen}: {e}; running without the API"
+                "WARNING: health: cannot listen on {health_listen}: {e}; running without it"
             ),
         }
     }

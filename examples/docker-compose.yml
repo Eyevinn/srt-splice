@@ -1,7 +1,6 @@
 # Run the relay locally: both SRT callers connect to udp://<host>:9000 with the
-# same streamid. The relay needs no passphrase. SRT_SPLICE_PUBLIC is the address
-# the outside world dials; the relay reports it on its internal HTTP API
-# (GET http://<host>:9001/v1/info), so a service such as Strom can show it.
+# same streamid. The relay needs no passphrase. Health check:
+# curl http://127.0.0.1:9001/healthz
 #
 #   docker compose -f examples/docker-compose.yml up --build
 services:
@@ -13,11 +12,10 @@ services:
       SRT_SPLICE_LISTEN: 0.0.0.0:9000
       # All interfaces inside the container; the port mapping below keeps it
       # on the host's loopback.
-      SRT_SPLICE_API: 0.0.0.0:9001
-      SRT_SPLICE_PUBLIC: ${SRT_SPLICE_PUBLIC:-localhost:9000}
+      SRT_SPLICE_HEALTH: 0.0.0.0:9001
     ports:
       - "9000:9000/udp"
-      # The API is for local services only: bound to loopback.
+      # The health endpoint stays on the host's loopback.
       - "127.0.0.1:9001:9001"
     restart: unless-stopped
     read_only: true

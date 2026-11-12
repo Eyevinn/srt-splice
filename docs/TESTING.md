@@ -5,7 +5,7 @@
 `cargo test` covers the wire format, the pairing rules (liveness, callers
 that do not repeat their conclusion, roles, encryption compatibility,
 reconnects, the libsrt 1.5.0–1.5.2 receiver guard), the fingerprints,
-which side gets the key update, the streamid parsing and the HTTP API.
+which side gets the key update, the streamid parsing and the health endpoint.
 
 ## Interop and end-to-end results
 
