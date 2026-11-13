@@ -76,7 +76,7 @@ const MAX_SID_LEN: usize = 512;
 /// within the path MTU; anything bigger is not from an SRT caller.
 const MAX_HS_LEN: usize = 1500;
 /// Callers waiting at a time from one network (an IPv4 address or an IPv6
-/// /64, see `limit::net`), over all streamids. Generous: everything behind
+/// /56, see `limit::net`), over all streamids. Generous: everything behind
 /// a cloud NAT gateway or a production cluster can share one address. It
 /// only keeps one host from taking all of `MAX_WAITING_TOTAL`.
 const MAX_WAITING_PER_NET: usize = 1000;
@@ -402,7 +402,7 @@ enum Admit {
 ///   the relay cannot tell which side is the stray, and refusing them would
 ///   let whoever came first block the session. Without a passphrase the
 ///   streamid is the only protection anyway.
-fn admit(waiting: &[&Party], new: &Party, now: Instant) -> Admit {
+fn admit(waiting: &[Party], new: &Party, now: Instant) -> Admit {
     if new.mode != Mode::Unknown {
         let same_role = waiting
             .iter()
@@ -508,7 +508,7 @@ struct Relay {
     by_dest: HashMap<u32, Vec<SocketAddr>>,
     /// Cap on the MSS granted in conclusion responses (`--max-mss`).
     max_mss: Option<u32>,
-    /// Handshake rate limits and bans.
+    /// Handshake rate limits (no bans; see `limit`).
     limiter: Limiter,
     next_prune: Instant,
 }
@@ -657,7 +657,13 @@ impl Relay {
             self.index_leg(old, dest, false);
             return false;
         };
-        if let Err(why) = rebind_allowed(old, leg.last_rx, from, p, Instant::now()) {
+        let allowed = if self.waiting_at.contains_key(&from) {
+            // A waiting caller is not a leg, and must never become one.
+            Err("the address is a caller waiting for a peer")
+        } else {
+            rebind_allowed(old, leg.last_rx, from, p, Instant::now())
+        };
+        if let Err(why) = allowed {
             // Once per new address, not per packet.
             if self.verbose && leg.refused_from.replace(from) != Some(from) {
                 let sid = leg.sid.clone();
@@ -748,9 +754,7 @@ impl Relay {
             }
             return;
         }
-        if !self.limiter.allow(from.ip(), Instant::now()) {
-            return;
-        }
+        let now = Instant::now();
         let Some(hs) = Handshake::parse(p) else {
             // The source may be spoofed: only with -v.
             if self.verbose {
@@ -758,6 +762,15 @@ impl Relay {
             }
             return;
         };
+        // A conclusion with a valid cookie comes from its real source: it
+        // does not count against the global budget, so a spoofed flood
+        // cannot starve callers that have already proven their address.
+        let verified = hs.hs_type == HS_CONCLUSION
+            && (self.cookie_ok(from, hs.cookie, now)
+                || self.admitted_cookie(from) == Some(hs.cookie));
+        if !self.limiter.allow(from.ip(), verified, now) {
+            return;
+        }
         match hs.hs_type {
             HS_INDUCTION => {
                 // An induction from the address of an established leg is
@@ -814,7 +827,7 @@ impl Relay {
             // Another socket on the address of an established leg: the
             // caller restarted on the same port. Only a valid cookie proves
             // the source; then the old session ends and this is a new caller.
-            if !self.cookie_ok(from, hs.cookie) {
+            if !self.cookie_ok(from, hs.cookie, now) {
                 if self.verbose {
                     log!(self, "{from}: conclusion with a wrong cookie, dropped");
                 }
@@ -822,15 +835,7 @@ impl Relay {
             }
             self.teardown(from, "caller restarted on the same address");
         }
-        // A waiting caller repeats the conclusion it was admitted with, cookie
-        // and all, for as long as it waits, which may outlast the cookie.
-        let admitted_cookie = self
-            .waiting_at
-            .get(&from)
-            .and_then(|sid| self.pending.get(sid))
-            .and_then(|w| w.iter().find(|c| c.addr == from))
-            .map(|c| c.hs.cookie);
-        if !self.cookie_ok(from, hs.cookie) && admitted_cookie != Some(hs.cookie) {
+        if !self.cookie_ok(from, hs.cookie, now) && self.admitted_cookie(from) != Some(hs.cookie) {
             // No recent induction from this address: spoofed or stale. Drop
             // silently, so the relay cannot be made to send to it.
             if self.verbose {
@@ -841,13 +846,14 @@ impl Relay {
         if hs.version != 5 {
             return self.reject(from, &hs, REJ_PEER, "not HSv5");
         }
-        let Some(raw_sid) = hs.streamid() else {
-            return self.reject(from, &hs, REJX_BAD_REQUEST, "no streamid");
-        };
-        if raw_sid.len() > MAX_SID_LEN {
+        // On the wire, before decoding: invalid UTF-8 grows when decoded.
+        if hs.ext(CMD_SID).is_some_and(|e| e.data.len() > MAX_SID_LEN) {
             let why = format!("streamid longer than {MAX_SID_LEN} bytes");
             return self.reject(from, &hs, REJX_BAD_REQUEST, &why);
         }
+        let Some(raw_sid) = hs.streamid() else {
+            return self.reject(from, &hs, REJX_BAD_REQUEST, "no streamid");
+        };
         let (sid, mode) = parse_streamid(&raw_sid);
         if hs.hsreq().is_none() {
             return self.reject(from, &hs, REJ_ROGUE, "no HSREQ");
@@ -910,16 +916,8 @@ impl Relay {
             }
             None => {}
         }
-        let key = net(from.ip());
-        if self.waiting_per_net.get(&key).copied().unwrap_or(0) >= MAX_WAITING_PER_NET {
-            let why = format!("too many callers waiting from {key}");
-            return self.reject(from, &party.hs, REJX_CONFLICT, &why);
-        }
-        if self.waiting_at.len() >= MAX_WAITING_TOTAL {
-            return self.reject(from, &party.hs, REJX_CONFLICT, "too many callers waiting");
-        }
-        let waiting: Vec<&Party> = self.pending.get(&sid).into_iter().flatten().collect();
-        match admit(&waiting, &party, now) {
+        let waiting: &[Party] = self.pending.get(&sid).map_or(&[], Vec::as_slice);
+        match admit(waiting, &party, now) {
             Admit::Reject(code, why) => {
                 return self.reject(from, &party.hs, code, &format!("streamid {sid:?}: {why}"));
             }
@@ -931,7 +929,18 @@ impl Relay {
                     "[{sid}] {from} replaces {old_addr} (same role {mode:?})"
                 );
             }
-            Admit::Wait => {}
+            Admit::Wait => {
+                // The caps apply to callers that add a place, not to one
+                // that takes over its own earlier attempt.
+                let key = net(from.ip());
+                if self.waiting_per_net.get(&key).copied().unwrap_or(0) >= MAX_WAITING_PER_NET {
+                    let why = format!("too many callers waiting from {key}");
+                    return self.reject(from, &party.hs, REJX_CONFLICT, &why);
+                }
+                if self.waiting_at.len() >= MAX_WAITING_TOTAL {
+                    return self.reject(from, &party.hs, REJX_CONFLICT, "too many callers waiting");
+                }
+            }
         }
         let waiting: &[Party] = self.pending.get(&sid).map_or(&[], Vec::as_slice);
         let what = if waiting.is_empty() {
@@ -965,8 +974,13 @@ impl Relay {
         let Some(ya) = ya else {
             return;
         };
-        if let (Some(a), Some(b)) = (self.take_waiting(xa), self.take_waiting(ya)) {
-            self.pair(a, b);
+        let Some(a) = self.take_waiting(xa) else {
+            return;
+        };
+        match self.take_waiting(ya) {
+            Some(b) => self.pair(a, b),
+            // Never lose a caller: it keeps waiting.
+            None => self.push_waiting(a),
         }
     }
 
@@ -1003,10 +1017,20 @@ impl Relay {
         self.cookie_at(a, self.cookie_period(Instant::now()))
     }
 
-    /// Whether `c` is `a`'s cookie for this period or the one before.
-    fn cookie_ok(&self, a: SocketAddr, c: u32) -> bool {
-        let now = self.cookie_period(Instant::now());
-        c == self.cookie_at(a, now) || (now > 0 && c == self.cookie_at(a, now - 1))
+    /// Whether `c` is `a`'s cookie for the period of `now` or the one
+    /// before.
+    fn cookie_ok(&self, a: SocketAddr, c: u32, now: Instant) -> bool {
+        let p = self.cookie_period(now);
+        c == self.cookie_at(a, p) || (p > 0 && c == self.cookie_at(a, p - 1))
+    }
+
+    /// The cookie of the conclusion the caller waiting at `a` was admitted
+    /// with. It repeats that conclusion, cookie and all, for as long as it
+    /// waits, which may outlast the cookie's period.
+    fn admitted_cookie(&self, a: SocketAddr) -> Option<u32> {
+        let sid = self.waiting_at.get(&a)?;
+        let c = self.pending.get(sid)?.iter().find(|c| c.addr == a)?;
+        Some(c.hs.cookie)
     }
 
     /// Pairs two compatible callers (see `compatible`).
@@ -1163,7 +1187,11 @@ impl Relay {
     fn log_dropped(&mut self) {
         let n = self.limiter.take_dropped();
         if n > 0 {
-            log!(self, "rate limit: dropped {n} handshakes in the last 5 s");
+            log!(
+                self,
+                "rate limit: dropped {n} handshakes in the last {} s",
+                STATS_EVERY.as_secs()
+            );
         }
     }
 
@@ -1453,11 +1481,6 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// `admit` on a list of owned callers.
-    fn admit_v(waiting: &[Party], new: &Party, now: Instant) -> Admit {
-        admit(&waiting.iter().collect::<Vec<_>>(), new, now)
-    }
-
     #[test]
     fn streamid_plain_and_access_control() {
         assert_eq!(parse_streamid("cam1"), ("cam1".into(), Mode::Unknown));
@@ -1532,7 +1555,7 @@ mod tests {
         assert!(both_alive(&once, &snd, ms(2000)));
         assert!(!both_alive(&once, &snd, ms(2600)));
         let mut waiting = vec![once];
-        assert_eq!(admit_v(&waiting, &snd, ms(2000)), Admit::Wait);
+        assert_eq!(admit(&waiting, &snd, ms(2000)), Admit::Wait);
         waiting.push(snd);
         assert_eq!(best_peer(&waiting, 1, ms(2000)), Some(0));
         // Two single-shot callers pair on the second's arrival.
@@ -1798,7 +1821,7 @@ mod tests {
         let rcv = party(1, Mode::Unknown, ms(0), ms(0));
         let snd = party(2, Mode::Unknown, ms(1000), ms(1000));
         let mut waiting = vec![rcv];
-        assert_eq!(admit_v(&waiting, &snd, ms(1000)), Admit::Wait);
+        assert_eq!(admit(&waiting, &snd, ms(1000)), Admit::Wait);
         waiting.push(snd);
         waiting[0].last_seen = ms(1100);
         assert_eq!(best_peer(&waiting, 0, ms(1100)), Some(1));
@@ -1813,9 +1836,9 @@ mod tests {
         let snd = enc(party(3, Mode::Unknown, ms(1000), ms(1000)), 2, 16);
         let mut waiting = vec![stray];
         // The encrypted receiver is not refused because of the stray.
-        assert_eq!(admit_v(&waiting, &rcv, ms(500)), Admit::Wait);
+        assert_eq!(admit(&waiting, &rcv, ms(500)), Admit::Wait);
         waiting.push(rcv);
-        assert_eq!(admit_v(&waiting, &snd, ms(1000)), Admit::Wait);
+        assert_eq!(admit(&waiting, &snd, ms(1000)), Admit::Wait);
         waiting.push(snd);
         // Everyone repeats; the stray is the most recent, and never chosen.
         waiting[1].last_seen = ms(1100);
@@ -1834,18 +1857,18 @@ mod tests {
         let stray = from_host(party(2, Mode::Unknown, ms(500), ms(500)), 9);
         let waiting = vec![rcv];
         assert!(matches!(
-            admit_v(&waiting, &stray, ms(500)),
+            admit(&waiting, &stray, ms(500)),
             Admit::Reject(REJ_UNSECURE, _)
         ));
         // An encrypted caller with other settings is never refused: it
         // cannot block a correctly configured one that comes later.
         let other = enc(party(3, Mode::Unknown, ms(500), ms(500)), 2, 32);
-        assert_eq!(admit_v(&waiting, &other, ms(500)), Admit::Wait);
+        assert_eq!(admit(&waiting, &other, ms(500)), Admit::Wait);
         // Only waiting callers of a compatible role count: a clear m=request
         // next to an encrypted m=request just waits.
         let req = enc(party(4, Mode::Request, ms(0), ms(400)), 2, 16);
         let clear_req = from_host(party(5, Mode::Request, ms(500), ms(500)), 9);
-        assert_eq!(admit_v(&[req], &clear_req, ms(500)), Admit::Wait);
+        assert_eq!(admit(&[req], &clear_req, ms(500)), Admit::Wait);
     }
 
     #[test]
@@ -1857,10 +1880,10 @@ mod tests {
         let rcv = enc(party(2, Mode::Request, ms(500), ms(500)), 2, 16);
         let mut waiting = vec![stray];
         // Not a 1409: the stray could never pair with the receiver's peer.
-        assert_eq!(admit_v(&waiting, &rcv, ms(500)), Admit::Wait);
+        assert_eq!(admit(&waiting, &rcv, ms(500)), Admit::Wait);
         waiting.push(rcv);
         let snd = enc(party(3, Mode::Publish, ms(1000), ms(1000)), 2, 16);
-        assert_eq!(admit_v(&waiting, &snd, ms(1000)), Admit::Wait);
+        assert_eq!(admit(&waiting, &snd, ms(1000)), Admit::Wait);
         waiting.push(snd);
         waiting[0].last_seen = ms(1100);
         waiting[1].last_seen = ms(1100);
@@ -1876,12 +1899,12 @@ mod tests {
         let waiting = vec![rcv];
         let other_host = from_host(enc(party(2, Mode::Request, ms(500), ms(500)), 2, 16), 9);
         assert!(matches!(
-            admit_v(&waiting, &other_host, ms(500)),
+            admit(&waiting, &other_host, ms(500)),
             Admit::Reject(REJX_CONFLICT, _)
         ));
         let reconnect = enc(party(3, Mode::Request, ms(500), ms(500)), 2, 16);
         assert_eq!(
-            admit_v(&waiting, &reconnect, ms(500)),
+            admit(&waiting, &reconnect, ms(500)),
             Admit::Replace(waiting[0].addr)
         );
     }
@@ -2210,7 +2233,7 @@ mod tests {
             r.on_packet(x, &conclusion(&r, x, 1, &format!("sid{i}"), None));
         }
         assert_eq!(r.waiting_at.len(), MAX_WAITING_PER_NET);
-        // An IPv6 host cannot get around it with more addresses in its /64.
+        // An IPv6 host cannot get around it with more addresses in its /56.
         for i in 0..MAX_WAITING_PER_NET as u16 + 5 {
             let x = at(&format!("2001:db8::{i:x}"), 1000);
             r.on_packet(x, &conclusion(&r, x, 1, &format!("v6-{i}"), None));
@@ -2275,29 +2298,79 @@ mod tests {
 
     #[test]
     fn cookies_expire_but_a_waiting_caller_keeps_its_own() {
+        let r = relay();
+        let a = at("127.0.0.1", 40001);
+        let period = |n: u32| r.t0 + COOKIE_PERIOD * n;
+        // Valid in its own period and the next, not after.
+        let c1 = r.cookie_at(a, 1);
+        assert!(r.cookie_ok(a, c1, period(1)) && r.cookie_ok(a, c1, period(2)));
+        assert!(!r.cookie_ok(a, c1, period(3)) && !r.cookie_ok(a, c1, period(0)));
+        // Bound to the address.
+        assert!(!r.cookie_ok(at("127.0.0.1", 40002), c1, period(1)));
+    }
+
+    #[test]
+    fn a_waiting_caller_repeats_with_the_cookie_it_was_admitted_with() {
         let mut r = relay();
         let a = at("127.0.0.1", 40001);
         r.on_packet(a, &conclusion(&r, a, 1, "s", None));
-        // Three cookie periods later.
-        let Some(t0) = r.t0.checked_sub(COOKIE_PERIOD * 3) else {
-            return; // the machine has not been up that long
-        };
-        let old = r.cookie(a);
-        r.t0 = t0;
-        assert!(!r.cookie_ok(a, old));
-        assert!(r.cookie_ok(a, r.cookie_at(a, 2)) && r.cookie_ok(a, r.cookie_at(a, 3)));
-        assert!(!r.cookie_ok(a, r.cookie_at(a, 1)));
-        // The caller repeats the conclusion it was admitted with: still counts.
+        // As if its cookie had expired since: only the admitted one counts.
+        let stale = r.cookie(a) ^ 0x5A5A;
+        r.pending.get_mut("s").unwrap()[0].hs.cookie = stale;
         let mut c = conclusion(&r, a, 1, "s", None);
-        c[HDR + 28..HDR + 32].copy_from_slice(&old.to_be_bytes());
-        r.pending.get_mut("s").unwrap()[0].last_seen = Instant::now();
+        c[HDR + 28..HDR + 32].copy_from_slice(&stale.to_be_bytes());
         r.on_packet(a, &c);
         assert_eq!(r.pending["s"][0].repeats, 1);
-        // A new address with that cookie gets nowhere.
+        // Another address with that cookie gets nowhere.
         let b = at("127.0.0.1", 40002);
-        c[HDR + 28..HDR + 32].copy_from_slice(&r.cookie_at(b, 0).to_be_bytes());
         r.on_packet(b, &c);
         assert!(!r.waiting_at.contains_key(&b));
+    }
+
+    #[test]
+    fn a_leg_never_moves_onto_a_waiting_caller() {
+        let (mut r, ca, _cb) = session();
+        let a = ca.local_addr().unwrap();
+        silent_for(&mut r, a, Duration::from_secs(1));
+        let x = at("127.0.0.1", 40009);
+        r.on_packet(x, &conclusion(&r, x, 9, "other", None));
+        r.on_packet(x, &data_to(0x222, 1));
+        assert!(r.legs.contains_key(&a) && !r.legs.contains_key(&x));
+        assert_consistent(&r);
+    }
+
+    #[test]
+    fn a_reconnect_replaces_its_own_attempt_even_at_the_cap() {
+        let mut r = relay();
+        for i in 0..MAX_WAITING_PER_NET as u16 - 1 {
+            let x = at("192.0.2.1", 1000 + i);
+            r.on_packet(x, &conclusion(&r, x, 1, &format!("sid{i}"), None));
+        }
+        let old = at("192.0.2.1", 5000);
+        r.on_packet(old, &conclusion(&r, old, 1, "#!::r=cam,m=publish", None));
+        assert_eq!(r.waiting_at.len(), MAX_WAITING_PER_NET);
+        // The same caller from a new port: takes its place.
+        let new = at("192.0.2.1", 5001);
+        r.on_packet(new, &conclusion(&r, new, 2, "#!::r=cam,m=publish", None));
+        assert!(r.waiting_at.contains_key(&new) && !r.waiting_at.contains_key(&old));
+        // A new caller is still refused.
+        let other = at("192.0.2.1", 5002);
+        r.on_packet(other, &conclusion(&r, other, 3, "more", None));
+        assert!(!r.waiting_at.contains_key(&other));
+        assert_consistent(&r);
+    }
+
+    #[test]
+    fn streamid_length_is_counted_on_the_wire() {
+        // 400 bytes of Latin-1: under the limit, though decoding would
+        // triple it.
+        let mut r = relay();
+        let a = at("127.0.0.1", 40001);
+        let mut c = conclusion(&r, a, 1, &"x".repeat(400), None);
+        let start = c.len() - 400;
+        c[start..].iter_mut().for_each(|b| *b = 0xE9);
+        r.on_packet(a, &c);
+        assert_eq!(r.waiting_at.len(), 1);
     }
 
     #[test]

@@ -290,12 +290,15 @@ bans: a host that keeps getting refused is most likely a caller retrying,
 and a ban would lock out everyone behind its address.
 
 **Handshake rate** (`src/limit.rs`). Handshakes are limited per source
-network, counting an IPv4 address or an IPv6 /64 as one (one host may hold a
-whole /64): 1000 a second, bursts of 2000. A waiting caller sends about 4 a
+network, counting an IPv4 address or an IPv6 /56 as one (the usual
+allocation for one customer site; one host may hold many addresses): 1000
+a second, bursts of 2000. A waiting caller sends about 4 a
 second (a conclusion every 250 ms) and reconnects about every 3 s, so that
 is room for some 200 callers waiting at once behind one address. In total,
-20,000 a second (bursts of 40,000), so a flood cannot take the forwarding
-thread. Over the limit, handshakes are dropped, not refused: a caller loses
+20,000 a second (bursts of 40,000) for handshakes whose source is not
+proven, so a flood cannot take the forwarding thread. Conclusions with a
+valid cookie do not count against that, so a spoofed flood cannot starve
+callers that have already proven their address. Over the limit, handshakes are dropped, not refused: a caller loses
 a few repeats and keeps trying, as on a lossy path. Established sessions
 are never limited. What is dropped is logged once every 5 s.
 `--no-rate-limit` turns it off.
@@ -307,9 +310,13 @@ are never limited. What is dropped is logged once every 5 s.
   two streamids corrupted the session table, and a later packet crashed the
   relay.
 - At most 1000 waiting callers per network and 20,000 in total (each holds
-  at most a 1500-byte handshake: some 40 MB when full).
-- Streamids longer than 512 bytes (libsrt's and gosrt's own limit) are
-  refused, and handshake packets over 1500 bytes (more than fits in one
+  at most a 1500-byte handshake: some 40 MB when full). A caller that takes
+  over its own earlier attempt (same role, same host) is never refused by
+  these caps.
+- A waiting caller's address never becomes a session leg through NAT
+  rebinding.
+- Streamids longer than 512 bytes on the wire (libsrt's and gosrt's own
+  limit) are refused, and handshake packets over 1500 bytes (more than fits in one
   packet) are dropped.
 
 **Cookies** change every 10 minutes; one is valid for 10 to 20 minutes.
@@ -346,6 +353,10 @@ so a panic would end all of them. Clippy denies `unwrap`, `expect`,
   global handshake budget while they last: new sessions cannot start, but
   established ones run on. A network's own budget can also be used up by
   spoofing its address.
+- **Someone with 20 networks** (IPv4 addresses or IPv6 /56s) can fill the
+  20,000 waiting places with callers on made-up streamids, and new callers
+  are refused while they keep repeating. Running sessions are not
+  affected.
 - **Volume.** One thread reads every packet, also those it drops. A flood
   above what it can read fills the socket's receive buffer, and the kernel
   then drops packets of every session alike. Against that, only filtering
