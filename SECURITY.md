@@ -20,5 +20,10 @@ In scope: anything that lets a remote party crash the relay with crafted
 packets, take over or disrupt a session it does not own, or learn more than
 the SRT header already shows in clear text.
 
-Known and by design (see the Security section of the README): the streamid
-is the pairing key, and there is no authentication or rate limiting yet.
+Known and by design (see the Security section of the README and
+[Abuse protection](docs/DESIGN.md#abuse-protection)): the streamid is the
+pairing key and there is no authentication, so whoever knows a streamid can
+take or block that session (not read it, with a passphrase). Floods from
+many networks, or with spoofed sources, can use up the global handshake
+budget while they last (established sessions are not affected), and a
+volume flood beyond what one thread can read affects every session.

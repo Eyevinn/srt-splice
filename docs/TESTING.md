@@ -6,7 +6,13 @@
 that do not repeat their conclusion, roles, encryption compatibility,
 reconnects, the libsrt 1.5.0–1.5.2 receiver guard), moving a leg to a
 new address (NAT rebinding) and what may not, the MSS cap, the fingerprints,
-which side gets the key update, the streamid parsing and the health endpoint.
+which side gets the key update, the streamid parsing and the health endpoint,
+and hostile callers: one address on several streamids, the per-network
+caps, oversized streamids and handshakes, spoofed packets from a session's
+address, cookie expiry and the rate limit. Also what legitimate callers
+must never trigger: 200 callers waiting behind one address, a caller
+refused again and again. Every test that drives the relay also checks that
+its indexes agree.
 
 ## Interop and end-to-end results
 
