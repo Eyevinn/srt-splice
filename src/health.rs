@@ -110,10 +110,10 @@ fn read_head(stream: &mut TcpStream, deadline: Instant) -> std::io::Result<Optio
         }
         // One deadline for the whole request, not per read.
         stream.set_read_timeout(Some(remaining(deadline)?))?;
-        let want = buf.len().min(MAX_HEAD - head.len());
-        match stream.read(&mut buf[..want]) {
+        let want = buf.len().min(MAX_HEAD.saturating_sub(head.len()));
+        match stream.read(buf.get_mut(..want).unwrap_or_default()) {
             Ok(0) => break,
-            Ok(n) => head.extend_from_slice(&buf[..n]),
+            Ok(n) => head.extend_from_slice(buf.get(..n).unwrap_or_default()),
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
@@ -124,9 +124,10 @@ fn read_head(stream: &mut TcpStream, deadline: Instant) -> std::io::Result<Optio
 /// Where the head ends (after the blank line), if it is complete.
 fn head_end(b: &[u8]) -> Option<usize> {
     (0..b.len()).find_map(|i| {
-        if b[i..].starts_with(b"\r\n\r\n") {
+        let rest = b.get(i..)?;
+        if rest.starts_with(b"\r\n\r\n") {
             Some(i + 4)
-        } else if b[i..].starts_with(b"\n\n") {
+        } else if rest.starts_with(b"\n\n") {
             Some(i + 2)
         } else {
             None

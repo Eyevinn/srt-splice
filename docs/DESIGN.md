@@ -272,6 +272,97 @@ The relay reads the version from the HSREQ:
 - **No direction:** never refused, since an affected caller that only sends
   works. The relay logs a warning at pairing.
 
+## Abuse protection
+
+The relay is a public UDP port without authentication: the streamid is the
+only key. These limits keep one host from exhausting the relay, and spoofed
+packets from disturbing a session. They do not stop someone who knows a
+streamid from taking or blocking that session (see *What remains* below).
+
+**Legitimate callers come first.** Many of them can share one source
+address: everything behind a cloud NAT gateway, a production cluster with
+dozens of outputs, a venue, a carrier-grade NAT, or a cluster that SNATs
+(`externalTrafficPolicy: Cluster`). And callers misbehave without malice: a
+second receiver on a 1:1 stream retries in a loop, a caller with a long
+connect timeout waits for minutes. So every limit is far above what such
+callers do, nothing that is legitimate leads to a refusal, and there are no
+bans: a host that keeps getting refused is most likely a caller retrying,
+and a ban would lock out everyone behind its address.
+
+**Handshake rate** (`src/limit.rs`). Handshakes are limited per source
+network, counting an IPv4 address or an IPv6 /56 as one (the usual
+allocation for one customer site; one host may hold many addresses): 1000
+a second, bursts of 2000. A waiting caller sends about 4 a
+second (a conclusion every 250 ms) and reconnects about every 3 s, so that
+is room for some 200 callers waiting at once behind one address. In total,
+20,000 a second (bursts of 40,000) for handshakes whose source is not
+proven, so a flood cannot take the forwarding thread. Conclusions with a
+valid cookie do not count against that, so a spoofed flood cannot starve
+callers that have already proven their address. Over the limit, handshakes are dropped, not refused: a caller loses
+a few repeats and keeps trying, as on a lossy path. Established sessions
+are never limited. What is dropped is logged once every 5 s.
+`--no-rate-limit` turns it off.
+
+**Waiting callers.**
+- An address (IP and port: one caller socket) waits on one streamid at a
+  time; a conclusion for another streamid moves it. A caller socket makes
+  one connection at a time anyway. Without this rule, one address paired on
+  two streamids corrupted the session table, and a later packet crashed the
+  relay.
+- At most 1000 waiting callers per network and 20,000 in total (each holds
+  at most a 1500-byte handshake: some 40 MB when full). A caller that takes
+  over its own earlier attempt (same role, same host) is never refused by
+  these caps.
+- A waiting caller's address never becomes a session leg through NAT
+  rebinding.
+- Streamids longer than 512 bytes on the wire (libsrt's and gosrt's own
+  limit) are refused, and handshake packets over 1500 bytes (more than fits in one
+  packet) are dropped.
+
+**Cookies** change every 10 minutes; one is valid for 10 to 20 minutes.
+A waiting caller repeats the conclusion it was admitted with, cookie and
+all, for as long as it waits, so that one stays valid for it however long it
+waits.
+
+**Spoofed packets from a session's address.** Every packet a caller sends
+names its peer's socket id: libsrt does (tested: no packet dropped in
+an AES session), and gosrt (`pop()` in connection.go, v0.9.0) and
+srt-protocol (`output` and `encapsulate`, 0.4.4) do in their source.
+srt-protocol itself drops packets with another socket id. A packet that does not is dropped and
+counted as `foreign` in the stats. The first one per session is logged, so
+that a caller that ever did this would show. A spoofed source then also has
+to guess the 32-bit socket id, as with a direct SRT connection. An
+induction from a session's address is answered but does not end the
+session; a caller that really restarted on the same port follows with a
+conclusion with a valid cookie and a new socket id, and only that ends the
+old session.
+
+**No panics.** The relay is one process and one thread for all sessions,
+so a panic would end all of them. Clippy denies `unwrap`, `expect`,
+`panic!` and indexing outside the tests.
+
+**What remains:**
+- **Whoever knows a streamid can take or block it.** They can pair first and
+  answer the key update by echoing it (which is all a KMRSP is), so the
+  relay cannot tell that they cannot decrypt. Or they pair two sockets of
+  their own on it and keep that session up. A passphrase keeps the media
+  unreadable, not the session available. Signed streamids (a token the
+  relay can verify, bound to the role and with an expiry) would fix this,
+  but need support in the callers' tooling.
+- **Floods from many networks, or with spoofed sources,** can use up the
+  global handshake budget while they last: new sessions cannot start, but
+  established ones run on. A network's own budget can also be used up by
+  spoofing its address.
+- **Someone with 20 networks** (IPv4 addresses or IPv6 /56s) can fill the
+  20,000 waiting places with callers on made-up streamids, and new callers
+  are refused while they keep repeating. Running sessions are not
+  affected.
+- **Volume.** One thread reads every packet, also those it drops. A flood
+  above what it can read fills the socket's receive buffer, and the kernel
+  then drops packets of every session alike. Against that, only filtering
+  in front of the relay helps (the cloud provider's DDoS protection, a
+  firewall).
+
 ## What the relay sees
 
 What SRT carries in clear text: sequence numbers, retransmit flags, the key
@@ -284,6 +375,8 @@ per session with `-v`.
   long it can wait for its peer. The alternative, finishing the handshake
   early, would mean rewriting socket ids and sequence numbers later. That
   breaks the AES counter (CTR uses the sequence number) and the GCM tag.
+- **A passphrase does not protect availability.** See
+  [Abuse protection](#abuse-protection).
 - **A wrong passphrase gives no KMRSP from libsrt** for an in-band KMREQ it
   cannot unwrap. The relay only notices by timeout (3 s), and only when the
   direction is known (see [Encryption](#encryption)).

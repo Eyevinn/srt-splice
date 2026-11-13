@@ -101,6 +101,7 @@ How this works in detail: [docs/DESIGN.md](docs/DESIGN.md).
 | `--health` (`SRT_SPLICE_HEALTH`) | `127.0.0.1:9001` (image: `0.0.0.0:9001`) | HTTP health endpoint for probes, `off` to disable. Internal network only. |
 | `--max-mss` (`SRT_SPLICE_MAX_MSS`) | no cap | Cap the MSS granted to callers (76–1500), e.g. 1450 on a VXLAN pod network. See [MTU](docs/DEPLOYMENT.md#mtu). |
 | `--no-fingerprint` | off | Without a stated direction, do not guess the caller's SRT implementation. |
+| `--no-rate-limit` (`SRT_SPLICE_NO_RATE_LIMIT=1`) | off | Turn off the handshake rate limit, e.g. for load tests from one host. See [Abuse protection](docs/DESIGN.md#abuse-protection). |
 | `-v` | off | Log per-session stats every 5 s. |
 
 A command-line option wins over its environment variable.
@@ -133,10 +134,20 @@ This is added in [Eyevinn/strom#1258](https://github.com/Eyevinn/strom/pull/1258
 - **Use a passphrase.** Encryption runs end to end between the two callers.
   Without the passphrase, an intruder with the right streamid gets no usable
   data.
+- **A passphrase protects the content, not the session.** Someone who
+  knows the streamid can still take the other end before the real caller
+  does, or keep the streamid busy, and so deny the session. They cannot
+  read or alter the media. Keep streamids as secret as passphrases.
 - The relay sees what SRT carries in clear text: sequence numbers, packet
-  and byte counts, and the streamid.
-- There is no authentication, access policy or rate limit in the relay.
-  Keep the health port off the public network.
+  and byte counts, and the streamid. Anyone on the path sees the streamid
+  too.
+- Handshakes are rate limited per source network and in total, with limits
+  far above what legitimate callers send, even many behind one NAT. Waiting
+  callers are capped per network and in total. Packets from a session's
+  address that are not addressed to its peer are dropped. See
+  [Abuse protection](docs/DESIGN.md#abuse-protection).
+- There is no authentication or access policy in the relay. Keep the
+  health port off the public network.
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
