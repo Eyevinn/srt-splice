@@ -35,11 +35,11 @@ the container, for the readiness probe.
     With long random streamids that only matters if one leaks.
   See also [Load balancer](#load-balancer).
 - **Readiness:** `GET /healthz` on the health port.
-- **Strom in the same cluster:** `STROM_SRT_RELAY=<public host:port>` (the
-  load balancer's address, shown to the outside party) and
+- **Strom in the same cluster:** `STROM_SRT_RELAY_PUBLIC=<public host:port>`
+  (the load balancer's address, shown to the outside party) and
   `STROM_SRT_RELAY_INTERNAL=srt-splice-internal:9000` (what Strom dials,
   avoiding hairpin NAT). With a relay elsewhere, for example a managed
-  service, only `STROM_SRT_RELAY=<public host:port>` is needed.
+  service, only `STROM_SRT_RELAY_PUBLIC=<public host:port>` is needed.
 
 **Scaling out:** run several relays, each with its own public address, and
 have the service that hands out addresses (for example Strom) choose one per

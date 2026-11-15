@@ -96,11 +96,11 @@ spec:
 # Internal access to the SRT port for services in the same cluster, so they
 # do not have to hairpin through the load balancer.
 # Strom in this cluster:
-#   STROM_SRT_RELAY=<public host:port>   (the load balancer's address; Strom
-#                                         shows it to the outside party)
+#   STROM_SRT_RELAY_PUBLIC=<public host:port>   (the load balancer's address;
+#                                                Strom shows it to the outside party)
 #   STROM_SRT_RELAY_INTERNAL=srt-splice-internal:9000   (what Strom dials)
 # A relay elsewhere (e.g. a managed service) needs only
-#   STROM_SRT_RELAY=<public host:port>
+#   STROM_SRT_RELAY_PUBLIC=<public host:port>
 apiVersion: v1
 kind: Service
 metadata:

@@ -116,14 +116,19 @@ Running it in Kubernetes, Docker and behind NAT: [docs/DEPLOYMENT.md](docs/DEPLO
 
 Strom dials the relay itself when an SRT block's `srt_uri` is
 `srt+relay://<id>?passphrase=…` and Strom is started with
-`STROM_SRT_RELAY=<public host>:9000`, the relay's public address. Strom dials
-it and shows it to the outside party as the place to connect. When Strom runs
-next to the relay (same cluster or network), also set
+`STROM_SRT_RELAY_PUBLIC=<public host>:9000`, the relay's public address. Strom
+dials it and shows it to the outside party as the place to connect. When Strom
+runs next to the relay (same cluster or network), also set
 `STROM_SRT_RELAY_INTERNAL=<internal host>:9000`: Strom then dials that
 address instead, and still shows the public one. This avoids hairpin NAT
-through the load balancer. The GUI has a
-"Publish via SRT relay" button that generates the id and the passphrase.
-This is added in [Eyevinn/strom#1258](https://github.com/Eyevinn/strom/pull/1258).
+through the load balancer. In an SRT block, the GUI's "Relay" connection type
+generates the id and the passphrase.
+
+More relays by name (`srt+relay://<id>@<name>`, `STROM_SRT_RELAYS`) and the
+config file form (`[relays.srt.<name>]`): Strom's
+[SRT_RELAY.md](https://github.com/Eyevinn/strom/blob/main/docs/SRT_RELAY.md).
+Added in [Eyevinn/strom#1262](https://github.com/Eyevinn/strom/pull/1262)
+(Strom 0.8.2).
 
 ## Security
 
