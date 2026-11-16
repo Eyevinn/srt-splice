@@ -52,7 +52,7 @@ fn serve(listener: TcpListener) {
             }
             Err(e) => {
                 if !failing {
-                    eprintln!("health: accept: {e}");
+                    let _ = writeln!(std::io::stderr(), "health: accept: {e}");
                     failing = true;
                 }
                 std::thread::sleep(ACCEPT_BACKOFF);

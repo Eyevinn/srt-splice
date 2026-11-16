@@ -35,8 +35,8 @@ the container, for the readiness probe.
     With long random streamids that only matters if one leaks.
   - the per-network limits (handshake rate, waiting callers; see
     [DESIGN.md](DESIGN.md#abuse-protection)) apply to all callers behind
-    one SNAT address together. They leave room for some 200 callers
-    waiting at once per address.
+    one SNAT address together. They leave room for 1000 callers waiting
+    at once per address.
   See also [Load balancer](#load-balancer).
 - **Readiness:** `GET /healthz` on the health port.
 - **Strom in the same cluster:** `STROM_SRT_RELAY=<public host:port>` (the

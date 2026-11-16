@@ -9,11 +9,14 @@ new address (NAT rebinding) and what may not, the MSS cap, the fingerprints,
 which side gets the key update, the streamid parsing and the health endpoint,
 and hostile callers: one address on several streamids, the per-network
 caps, oversized streamids and handshakes, spoofed packets from a session's
-address, cookie expiry, a leg never moving onto a waiting caller, and the
-rate limit (also with a spoofed flood and a full table). Also what legitimate callers
-must never trigger: 200 callers waiting behind one address, a caller
-refused again and again, a reconnect at the per-network cap, a long
-streamid that is not UTF-8. Every test that drives the relay also checks that
+address, cookie expiry, a leg never moving onto a waiting caller,
+streamids with control characters, and the rate limit (a spoofed flood
+against verified callers, a full table, wired into the handshake path). Also what legitimate callers
+must never trigger: 1000 callers waiting behind one address, a caller
+refused again and again, a reconnect at the per-network cap, a caller
+whose peer waits at the cap, a long streamid that is not UTF-8, a caller
+dropped for silence after its cookie expired, two sockets sharing a port,
+a receiver refused at pairing (its sender keeps waiting). Every test that drives the relay also checks that
 its indexes agree.
 
 ## Interop and end-to-end results
