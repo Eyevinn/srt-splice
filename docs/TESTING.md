@@ -6,7 +6,18 @@
 that do not repeat their conclusion, roles, encryption compatibility,
 reconnects, the libsrt 1.5.0–1.5.2 receiver guard), moving a leg to a
 new address (NAT rebinding) and what may not, the MSS cap, the fingerprints,
-which side gets the key update, the streamid parsing and the health endpoint.
+which side gets the key update, the streamid parsing and the health endpoint,
+and hostile callers: one address on several streamids, the per-network
+caps, oversized streamids and handshakes, spoofed packets from a session's
+address, cookie expiry, a leg never moving onto a waiting caller,
+streamids with control characters, and the rate limit (a spoofed flood
+against verified callers, a full table, wired into the handshake path). Also what legitimate callers
+must never trigger: 1000 callers waiting behind one address, a caller
+refused again and again, a reconnect at the per-network cap, a caller
+whose peer waits at the cap, a long streamid that is not UTF-8, a caller
+dropped for silence after its cookie expired, two sockets sharing a port,
+a receiver refused at pairing (its sender keeps waiting). Every test that drives the relay also checks that
+its indexes agree.
 
 ## Interop and end-to-end results
 
@@ -45,6 +56,35 @@ macOS, loopback, libsrt 1.5.6 `srt-live-transmit` and the Rust
 | NAT rebinding, sender and receiver, latency 1000 ms | ✅ 0 lost, p99 1052 / 1051 ms: the stall is hidden |
 | `--max-mss 1400`, AES-128 | ✅ granted 1400 to both sides (in the PAIR log), 0 lost with 1316-byte payloads (`-chunk:1316`). With `srt-live-transmit`'s default 1456-byte chunks the sender refuses each message ("can't fit into a single data packet (1356 bytes max)"), as expected |
 | AES-GCM | ⚠️ untested: Homebrew's libsrt is built without `ENABLE_AEAD_API_PREVIEW` and silently uses CTR |
+
+### Interop matrix (abuse protection, 0.4)
+
+Every sender × receiver among libsrt 1.5.7 (`srt-live-transmit`), gosrt
+0.13.0 (`contrib/client`) and srt-protocol 0.4.4 (a minimal `srt-tokio`
+caller), clear and AES-128, with a direction (`m=publish` / `m=request`)
+and without: 36 runs, 1000 packets of 1316 bytes each, 1 ms apart. The same
+matrix against 0.3.0 (`main`) gave the same results in every run: no
+regression. In every run, no packet was dropped as `foreign` (a wrong
+destination socket id), and nothing was rate limited.
+
+| Sender → receiver | Result |
+|---|---|
+| libsrt → libsrt, gosrt, srt-protocol | ✅ everything the sender sent arrives (relay and receiver counts agree). `srt-live-transmit` itself drops the first 10–40 packets it reads before it is connected; gosrt as receiver got all 1000 |
+| gosrt → libsrt, gosrt | ✅ 1000 of 1000, clear and AES (as receiver, gosrt only clear, see below) |
+| srt-protocol → libsrt, srt-protocol | ✅ 1000 of 1000, clear and AES |
+| gosrt ↔ srt-protocol | ❌ as with a direct connection: gosrt refuses peers below SRT 1.4 ("peer SRT version is not sufficient"), and srt-protocol announces 1.3.1 |
+| any → gosrt, AES | ❌ as expected: gosrt does not take the injected key (see [DESIGN.md](DESIGN.md#gosrt)) |
+| Receiver with `conntimeo=1500` and auto-reconnect, sender after 4 s, AES (after the `DEAD_AFTER` change to 650 ms) | ✅ 5 attempts, 3 replaced, paired once with the live one, 1000 of 1000 |
+
+Two things found along the way, both the same with a direct connection:
+- srt-protocol announces its payload size as the MSS in the handshake
+  (1316 by default). Any peer, through the relay or not, then gets the
+  smaller MSS, and libsrt refuses 1316-byte messages ("can't fit into a
+  single data packet (1272 bytes max)"). Set srt-protocol's
+  `max_payload_size` to 1456.
+- A sender that closes right after its last packet (gosrt's client at the
+  end of its input) sends a shutdown, and the receiver drops what is still
+  in its latency buffer (about the last 120 ms).
 
 The libsrt 1.4 and 1.5.1 cases ran in Docker (colima) on macOS against the
 relay on the host, with the distro packages (GnuTLS flavour on Debian) and

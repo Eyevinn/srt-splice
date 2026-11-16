@@ -45,20 +45,31 @@ pub const REJX_CONFLICT: u32 = 1409;
 const KM_OFS_CIPHER: usize = 8;
 const KM_OFS_KLEN: usize = 15;
 
+/// The big-endian 32-bit word at `off`, or 0 if `b` is too short. Callers
+/// check lengths first; this only makes sure a mistake cannot panic.
 fn be32(b: &[u8], off: usize) -> u32 {
-    u32::from_be_bytes(b[off..off + 4].try_into().unwrap())
+    b.get(off..off.saturating_add(4))
+        .and_then(|w| w.try_into().ok())
+        .map_or(0, u32::from_be_bytes)
+}
+
+/// The big-endian 16-bit word at `off`, or 0 if `b` is too short.
+fn be16(b: &[u8], off: usize) -> u16 {
+    b.get(off..off.saturating_add(2))
+        .and_then(|w| w.try_into().ok())
+        .map_or(0, u16::from_be_bytes)
 }
 
 pub fn is_control(p: &[u8]) -> bool {
-    p.len() >= HDR && p[0] & 0x80 != 0
+    p.len() >= HDR && be16(p, 0) & 0x8000 != 0
 }
 
 pub fn ctrl_type(p: &[u8]) -> u16 {
-    (u16::from_be_bytes([p[0], p[1]])) & 0x7FFF
+    be16(p, 0) & 0x7FFF
 }
 
 pub fn ctrl_subtype(p: &[u8]) -> u16 {
-    u16::from_be_bytes([p[2], p[3]])
+    be16(p, 2)
 }
 
 pub fn timestamp(p: &[u8]) -> u32 {
@@ -110,36 +121,31 @@ pub struct Handshake {
 
 impl Handshake {
     pub fn parse(p: &[u8]) -> Option<Handshake> {
-        if p.len() < HDR + HS_CIF {
-            return None;
-        }
-        let c = &p[HDR..];
+        let c = p.get(HDR..).filter(|c| c.len() >= HS_CIF)?;
         let mut hs = Handshake {
             version: be32(c, 0),
-            enc_field: u16::from_be_bytes([c[4], c[5]]),
-            ext_field: u16::from_be_bytes([c[6], c[7]]),
+            enc_field: be16(c, 4),
+            ext_field: be16(c, 6),
             isn: be32(c, 8),
             mss: be32(c, 12),
             flow: be32(c, 16),
             hs_type: be32(c, 20),
             socket_id: be32(c, 24),
             cookie: be32(c, 28),
-            peer_ip: c[32..48].try_into().unwrap(),
+            peer_ip: c.get(32..48)?.try_into().ok()?,
             exts: Vec::new(),
         };
-        let mut off = HS_CIF;
-        while off + 4 <= c.len() {
-            let cmd = u16::from_be_bytes([c[off], c[off + 1]]);
-            let words = u16::from_be_bytes([c[off + 2], c[off + 3]]) as usize;
-            let end = off + 4 + words * 4;
-            if end > c.len() {
-                return None;
-            }
+        let mut rest = c.get(HS_CIF..)?;
+        while rest.len() >= 4 {
+            let cmd = be16(rest, 0);
+            let words = usize::from(be16(rest, 2));
+            // Truncated: not a handshake we can trust.
+            let data = rest.get(4..4 + words * 4)?;
             hs.exts.push(Ext {
                 cmd,
-                data: c[off + 4..end].to_vec(),
+                data: data.to_vec(),
             });
-            off = end;
+            rest = rest.get(4 + words * 4..)?;
         }
         Some(hs)
     }
@@ -212,5 +218,8 @@ pub fn handshake_packet(hs: &Handshake, ts: u32, dest: u32) -> Vec<u8> {
 
 /// Key material summary: (cipher, key length in bytes). Cipher 2 = AES-CTR, 4 = AES-GCM.
 pub fn km_params(km: &[u8]) -> Option<(u8, u16)> {
-    (km.len() > KM_OFS_KLEN).then(|| (km[KM_OFS_CIPHER], km[KM_OFS_KLEN] as u16 * 4))
+    Some((
+        *km.get(KM_OFS_CIPHER)?,
+        u16::from(*km.get(KM_OFS_KLEN)?) * 4,
+    ))
 }
